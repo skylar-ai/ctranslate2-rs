@@ -23,6 +23,7 @@ include = [
     "!/CTranslate2/**/test",
     "!/CTranslate2/**/docs",
     "!/CTranslate2/**/media",
+    "!/CTranslate2/third_party/thrust/libcudacxx/*.md",
 ]
 keywords = ["ctranslate2", "bindings", "llm", "whisper"]
 license.workspace = true
