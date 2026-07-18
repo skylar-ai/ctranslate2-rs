@@ -171,7 +171,14 @@ fn build_ctranslate2() {
         library_paths.push(PathBuf::from(env::var("DEP_DNNL_LIBRARY_PATH").unwrap()));
     }
     if openmp_comp {
-        println!("cargo:rustc-link-lib=gomp");
+        // `gomp` is GNU's OpenMP runtime and does not exist on the MSVC toolchain,
+        // where linking it fails with `LNK1181: cannot open input file 'gomp.lib'`.
+        // MSVC's `/openmp` emits a `/DEFAULTLIB:VCOMP` directive into every object, so
+        // its OpenMP runtime is linked automatically and nothing is needed here. Other
+        // toolchains, including `*-pc-windows-gnu` (MinGW/GCC), still require it.
+        if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+            println!("cargo:rustc-link-lib=gomp");
+        }
         cmake.define("OPENMP_RUNTIME", "COMP");
     } else if openmp_intel {
         println!("cargo:rustc-link-lib=iomp5");
@@ -363,7 +370,11 @@ fn link_system_libraries() {
         println!("cargo:rustc-link-lib=dnnl");
     }
     if cfg!(feature = "openmp-runtime-comp") {
-        println!("cargo:rustc-link-lib=gomp");
+        // See the note above: `gomp` does not exist on MSVC (LNK1181); its OpenMP
+        // runtime is linked automatically via the /DEFAULTLIB:VCOMP directive.
+        if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("msvc") {
+            println!("cargo:rustc-link-lib=gomp");
+        }
     }
     if cfg!(feature = "openmp-runtime-intel") {
         println!("cargo:rustc-link-lib=iomp5");
