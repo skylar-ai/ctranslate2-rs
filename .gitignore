@@ -26,3 +26,4 @@ target
 # Ignore spec-driven folders and script files
 .specs/
 scripts/lessons.py
+tests/assets/*.wav
