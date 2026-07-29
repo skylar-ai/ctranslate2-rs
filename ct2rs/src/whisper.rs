@@ -239,6 +239,91 @@ impl Whisper {
     }
 }
 
+fn starts_new_word(token: &str) -> bool {
+    // If the token starts with 'Ġ' (GPT-2/Whisper space representation)
+    if token.starts_with('Ġ') {
+        return true;
+    }
+    // If the token starts with ' ' (SentencePiece space representation)
+    if token.starts_with(' ') {
+        return true;
+    }
+    // If the token starts with a regular space
+    if token.starts_with(' ') {
+        return true;
+    }
+    // If the token is a punctuation/special character (excluding letters and digits)
+    if let Some(first_char) = token.chars().next() {
+        if first_char.is_ascii_punctuation() {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_special_token(token: &str) -> bool {
+    token.starts_with("<|") && token.ends_with("|>")
+}
+
+fn group_tokens_into_words(tokens: &[String]) -> Vec<std::ops::Range<usize>> {
+    let mut word_ranges = Vec::new();
+    let mut current_word_start = None;
+
+    for (i, token) in tokens.iter().enumerate() {
+        if is_special_token(token) {
+            if let Some(start) = current_word_start {
+                word_ranges.push(start..i);
+                current_word_start = None;
+            }
+            continue;
+        }
+
+        if current_word_start.is_none() {
+            current_word_start = Some(i);
+        } else if starts_new_word(token) {
+            if let Some(start) = current_word_start {
+                word_ranges.push(start..i);
+            }
+            current_word_start = Some(i);
+        }
+    }
+
+    if let Some(start) = current_word_start {
+        word_ranges.push(start..tokens.len());
+    }
+
+    word_ranges
+}
+
+#[cfg(test)]
+mod tests_grouping {
+    use super::*;
+
+    #[test]
+    fn test_starts_new_word() {
+        assert!(starts_new_word("ĠHello"));
+        assert!(starts_new_word(" world"));
+        assert!(starts_new_word(" "));
+        assert!(starts_new_word("!"));
+        assert!(!starts_new_word("llo"));
+    }
+
+    #[test]
+    fn test_group_tokens_into_words() {
+        let tokens = vec![
+            "<|startoftranscript|>".to_string(),
+            "<|en|>".to_string(),
+            "<|transcribe|>".to_string(),
+            "ĠHello".to_string(),
+            "llo".to_string(),
+            "Ġworld".to_string(),
+            "!".to_string(),
+        ];
+        let ranges = group_tokens_into_words(&tokens);
+        assert_eq!(ranges, vec![3..5, 5..6, 6..7]);
+    }
+}
+
 impl Debug for Whisper {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.whisper)
