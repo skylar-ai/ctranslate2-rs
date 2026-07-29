@@ -17,11 +17,39 @@ use anyhow::{anyhow, Result};
 use mel_spec::mel::{log_mel_spectrogram, mel, norm_mel};
 use mel_spec::stft::Spectrogram;
 use ndarray::{s, stack, Array2, Axis};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use super::sys::WhisperOptions;
 use super::tokenizers::hf;
 use super::{sys, Config, Tokenizer};
+
+/// Represents a transcribed word with detailed timing and probability.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Word {
+    /// The transcribed word text.
+    pub word: String,
+    /// Start time in seconds relative to the audio start.
+    pub start: f32,
+    /// End time in seconds relative to the audio start.
+    pub end: f32,
+    /// Confidence probability score bounded between 0.0 and 1.0.
+    pub probability: f32,
+}
+
+/// Represents a transcribed audio segment with start/end timestamps and word-level information.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Segment {
+    /// Segment ID.
+    pub id: usize,
+    /// Text content of the segment.
+    pub text: String,
+    /// Start time in seconds relative to the audio start.
+    pub start: f32,
+    /// End time in seconds relative to the audio start.
+    pub end: f32,
+    /// Word-level alignment information.
+    pub words: Option<Vec<Word>>,
+}
 
 const PREPROCESSOR_CONFIG_FILE: &str = "preprocessor_config.json";
 
