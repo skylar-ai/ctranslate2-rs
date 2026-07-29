@@ -198,6 +198,161 @@ impl Whisper {
             .collect()
     }
 
+    /// Transcribe the given samples and return detailed word-level and segment-level timelines.
+    ///
+    /// # Arguments
+    /// * `samples` - Samples of the source audio. They must be sampled at the sampling rate
+    ///   returned by [`sampling_rate`][Whisper::sampling_rate] method and normalized to the range
+    ///   `[-1, 1]`. If the samples are longer than the maximum number of samples returned by
+    ///   [`n_samples`][Whisper::n_samples] method, they will be processed in segments.
+    /// * `language` - An optional language setting. It transcribes assuming the specified language.
+    ///   If `None`, it uses Whisper's language detection.
+    /// * `options` - Settings.
+    ///
+    /// # Returns
+    /// Returns a `Result` containing a vector of transcribed `Segment`s if successful,
+    /// or an error if the transcription fails.
+    pub fn transcribe(
+        &self,
+        samples: &[f32],
+        language: Option<&str>,
+        options: &WhisperOptions,
+    ) -> Result<Vec<Segment>> {
+        let mut stft = Spectrogram::new(self.config.n_fft, self.config.hop_length);
+
+        let mut mel_spectrogram_vec = vec![];
+        for chunk in samples.chunks(self.config.n_samples) {
+            let mut mel_spectrogram_per_chunk =
+                Array2::zeros((self.config.feature_size, self.config.nb_max_frames));
+            for (i, flame) in chunk.chunks(self.config.hop_length).enumerate() {
+                if let Some(fft_frame) = stft.add(flame) {
+                    let mel = norm_mel(&log_mel_spectrogram(&fft_frame, &self.config.mel_filters))
+                        .mapv(|v| v as f32);
+                    mel_spectrogram_per_chunk
+                        .slice_mut(s![.., i])
+                        .assign(&mel.slice(s![.., 0]));
+                }
+            }
+            mel_spectrogram_vec.push(mel_spectrogram_per_chunk);
+        }
+
+        if mel_spectrogram_vec.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut mel_spectrogram = stack(
+            Axis(0),
+            &mel_spectrogram_vec
+                .iter()
+                .map(|a| a.view())
+                .collect::<Vec<_>>(),
+        )?;
+        if !mel_spectrogram.is_standard_layout() {
+            mel_spectrogram = mel_spectrogram.as_standard_layout().into_owned()
+        }
+
+        let shape = mel_spectrogram.shape().to_vec();
+        let storage_view = sys::StorageView::new(
+            &shape,
+            mel_spectrogram.as_slice_mut().unwrap(),
+            Default::default(),
+        )?;
+
+        // Detect language.
+        let lang_token = match language {
+            Some(lang) => {
+                format!("<|{}|>", lang)
+            }
+            None => {
+                let detection_result = self.whisper.detect_language(&storage_view)?;
+                detection_result
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("failed to detect language"))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("failed to detect language"))?
+                    .language
+            }
+        };
+
+        // Pass features through the encoder network to get encoder outputs
+        let encoder_output = self.whisper.encode(&storage_view, false)?;
+
+        // Transcribe.
+        let prompt = vec!["<|startoftranscript|>", &lang_token, "<|transcribe|>"];
+        // For alignment and timing, we do want timestamps
+        let gen_results = self.whisper.generate(
+            &encoder_output,
+            &vec![prompt.clone(); mel_spectrogram_vec.len()],
+            options,
+        )?;
+
+        // Build start sequence token IDs for alignment FFI
+        let start_seq: Vec<usize> = prompt.iter()
+            .map(|t| self.tokenizer.token_to_id(t).map(|id| id as usize).unwrap_or(0))
+            .collect();
+
+        let num_frames = vec![self.config.nb_max_frames; mel_spectrogram_vec.len()];
+        let text_tokens: Vec<Vec<usize>> = gen_results.iter()
+            .map(|res| res.sequences_ids[0].clone())
+            .collect();
+
+        // Run DTW alignments on the encoder output cross-attention weights
+        let alignment_results = self.whisper.align(
+            &encoder_output,
+            &start_seq,
+            &text_tokens,
+            &num_frames,
+            7, // median filter width
+        )?;
+
+        let mut segments = Vec::new();
+
+        for (chunk_idx, (res, align_res)) in gen_results.iter().zip(alignment_results.iter()).enumerate() {
+            let tokens = &res.sequences[0];
+            let alignments = &align_res.alignments;
+            let text_token_probs = &align_res.text_token_probs;
+
+            let word_token_ranges = group_tokens_into_words(tokens);
+            let chunk_words = process_word_timings(&word_token_ranges, alignments, text_token_probs, tokens.len());
+
+            let chunk_offset = (chunk_idx * self.config.n_samples) as f32 / self.config.sampling_rate as f32;
+
+            let mut final_words = Vec::new();
+            for (range, mut word) in word_token_ranges.into_iter().zip(chunk_words.into_iter()) {
+                let word_text = self.tokenizer.decode(tokens[range.clone()].to_vec())?;
+                let clean_word_text = word_text.trim().to_string();
+                if clean_word_text.is_empty() {
+                    continue;
+                }
+                word.word = clean_word_text;
+                word.start += chunk_offset;
+                word.end += chunk_offset;
+                final_words.push(word);
+            }
+
+            let clean_tokens: Vec<String> = tokens.iter()
+                .filter(|t| !is_special_token(t))
+                .cloned()
+                .collect();
+            let chunk_text = self.tokenizer.decode(clean_tokens)?.trim().to_string();
+
+            let seg_start = final_words.first().map(|w| w.start).unwrap_or(chunk_offset);
+            let seg_end = final_words.last().map(|w| w.end).unwrap_or(chunk_offset);
+
+            segments.push(Segment {
+                id: chunk_idx,
+                text: chunk_text,
+                start: seg_start,
+                end: seg_end,
+                words: Some(final_words),
+            });
+        }
+
+        Ok(segments)
+    }
+
     /// Returns the expected sampling rate.
     pub fn sampling_rate(&self) -> usize {
         self.config.sampling_rate
