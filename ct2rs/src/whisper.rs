@@ -689,8 +689,42 @@ impl PreprocessorConfig {
 #[cfg(feature = "hub")]
 mod tests {
     use crate::{download_model, Config, Device, Whisper};
+    use std::path::Path;
 
     const MODEL_ID: &str = "jkawamoto/whisper-tiny-ct2";
+
+    fn read_audio<T: AsRef<Path>>(path: T, sample_rate: usize) -> anyhow::Result<Vec<f32>> {
+        use hound::WavReader;
+
+        fn resample(samples: Vec<f32>, src_rate: usize, target_rate: usize) -> Vec<f32> {
+            samples
+                .into_iter()
+                .step_by(src_rate / target_rate)
+                .collect()
+        }
+
+        let mut reader = WavReader::open(path)?;
+        let spec = reader.spec();
+
+        let max = 2_i32.pow((spec.bits_per_sample - 1) as u32) as f32;
+        let samples = reader
+            .samples::<i32>()
+            .map(|s| s.unwrap() as f32 / max)
+            .collect::<Vec<f32>>();
+
+        if spec.channels == 1 {
+            return Ok(resample(samples, spec.sample_rate as usize, sample_rate));
+        }
+
+        let mut mono = vec![];
+        for chunk in samples.chunks(2) {
+            if chunk.len() == 2 {
+                mono.push((chunk[0] + chunk[1]) / 2.);
+            }
+        }
+
+        Ok(resample(mono, spec.sample_rate as usize, sample_rate))
+    }
 
     #[test]
     #[ignore]
@@ -710,5 +744,48 @@ mod tests {
         .unwrap();
 
         assert!(format!("{:?}", w).contains(model_path.file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    #[ignore]
+    fn test_whisper_transcribe() {
+        let model_path = download_model(MODEL_ID).unwrap();
+        let w = Whisper::new(
+            &model_path,
+            Config {
+                device: if cfg!(feature = "cuda") {
+                    Device::CUDA
+                } else {
+                    Device::CPU
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let wav_path = std::path::Path::new("tests/assets/test.wav");
+        if !wav_path.exists() {
+            let output = std::process::Command::new("ffmpeg")
+                .args(&["-y", "-i", "tests/assets/test.m4a", "-ar", "16000", "-ac", "1", "tests/assets/test.wav"])
+                .output()
+                .expect("failed to execute ffmpeg");
+            assert!(output.status.success(), "ffmpeg conversion failed");
+        }
+
+        let samples = read_audio(wav_path, w.sampling_rate()).unwrap();
+
+        let segments = w.transcribe(&samples, Some("en"), &Default::default()).unwrap();
+        assert!(!segments.is_empty(), "Transcribed segments should not be empty");
+
+        for segment in &segments {
+            println!("Segment {}: [{:.2} - {:.2}]: {}", segment.id, segment.start, segment.end, segment.text);
+            if let Some(words) = &segment.words {
+                for word in words {
+                    println!("  Word: '{}' [{:.2} - {:.2}] prob={:.3}", word.word, word.start, word.end, word.probability);
+                    assert!(word.start <= word.end, "Word start time must be less than or equal to end time");
+                    assert!(word.probability >= 0.0 && word.probability <= 1.0, "Word probability must be between 0.0 and 1.0");
+                }
+            }
+        }
     }
 }
