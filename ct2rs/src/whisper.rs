@@ -295,6 +295,97 @@ fn group_tokens_into_words(tokens: &[String]) -> Vec<std::ops::Range<usize>> {
     word_ranges
 }
 
+fn process_word_timings(
+    word_token_ranges: &[std::ops::Range<usize>],
+    alignments: &[sys::WhisperTokenAlignment],
+    text_token_probs: &[f32],
+    num_tokens: usize,
+) -> Vec<Word> {
+    if num_tokens == 0 || word_token_ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let mut token_start_frames = vec![-1i64; num_tokens];
+    let mut token_end_frames = vec![-1i64; num_tokens];
+
+    // First pass: extract from alignments
+    for m in 0..num_tokens {
+        let aligned_frames: Vec<i64> = alignments.iter()
+            .filter(|a| a.token_x == m as i64)
+            .map(|a| a.frame_x)
+            .collect();
+        if !aligned_frames.is_empty() {
+            token_start_frames[m] = *aligned_frames.iter().min().unwrap();
+            token_end_frames[m] = *aligned_frames.iter().max().unwrap() + 1;
+        }
+    }
+
+    // Second pass: fill in missing/empty and enforce monotonicity
+    let mut last_end = 0;
+    for m in 0..num_tokens {
+        if token_start_frames[m] == -1 {
+            token_start_frames[m] = last_end;
+            token_end_frames[m] = last_end;
+        } else {
+            if token_start_frames[m] < last_end {
+                token_start_frames[m] = last_end;
+            }
+            if token_end_frames[m] < token_start_frames[m] {
+                token_end_frames[m] = token_start_frames[m];
+            }
+        }
+        last_end = token_end_frames[m];
+    }
+
+    // Convert token frames to words
+    let mut words = Vec::new();
+    for range in word_token_ranges {
+        let u = range.start;
+        let v = range.end - 1;
+
+        let word_start_frame = token_start_frames[u];
+        let word_end_frame = token_end_frames[v];
+
+        // 50.0 is the downsampled temporal resolution constant of Whisper encoder output (1 frame = 20ms)
+        let word_start_sec = word_start_frame as f32 / 50.0;
+        let word_end_sec = word_end_frame as f32 / 50.0;
+
+        // Confidence probability score as the arithmetic mean of token probabilities
+        let sum_prob: f32 = text_token_probs[u..=v].iter().sum();
+        let word_prob = sum_prob / (v - u + 1) as f32;
+
+        words.push(Word {
+            word: "".to_string(), // Text will be filled later by the caller
+            start: word_start_sec,
+            end: word_end_sec,
+            probability: word_prob,
+        });
+    }
+
+    // Apply Heuristic 2: Median-Based Duration Capping
+    let mut durations: Vec<f32> = words.iter()
+        .map(|w| w.end - w.start)
+        .filter(|&d| d > 0.0)
+        .collect();
+    if !durations.is_empty() {
+        durations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_idx = durations.len() / 2;
+        let mut d_median = durations[median_idx];
+        if d_median > 0.7 {
+            d_median = 0.7;
+        }
+        let d_max = 2.0 * d_median;
+        for w in &mut words {
+            let duration = w.end - w.start;
+            if duration > d_max {
+                w.end = w.start + d_max;
+            }
+        }
+    }
+
+    words
+}
+
 #[cfg(test)]
 mod tests_grouping {
     use super::*;
@@ -321,6 +412,40 @@ mod tests_grouping {
         ];
         let ranges = group_tokens_into_words(&tokens);
         assert_eq!(ranges, vec![3..5, 5..6, 6..7]);
+    }
+
+    #[test]
+    fn test_process_word_timings() {
+        use crate::sys::WhisperTokenAlignment;
+
+        let word_token_ranges = vec![0..2, 2..3]; // Two words: token 0..2, token 2..3
+        // Token 0 aligned to frames 10..15, Token 1 has no alignments, Token 2 aligned to frame 20..22
+        let alignments = vec![
+            WhisperTokenAlignment { token_x: 0, frame_x: 10 },
+            WhisperTokenAlignment { token_x: 0, frame_x: 14 },
+            WhisperTokenAlignment { token_x: 2, frame_x: 20 },
+            WhisperTokenAlignment { token_x: 2, frame_x: 21 },
+        ];
+        let text_token_probs = vec![0.9, 0.8, 0.95];
+
+        let words = process_word_timings(&word_token_ranges, &alignments, &text_token_probs, 3);
+        assert_eq!(words.len(), 2);
+
+        // Word 0 (tokens 0..1):
+        // Token 0: starts at 10, ends at 15
+        // Token 1: starts at last_end (15), ends at last_end (15)
+        // Word 0: starts at 10 (0.2s), ends at 15 (0.3s)
+        assert_eq!(words[0].start, 0.2);
+        assert_eq!(words[0].end, 0.3);
+        // Average probability: (0.9 + 0.8) / 2 = 0.85
+        assert_eq!(words[0].probability, 0.85);
+
+        // Word 1 (token 2):
+        // Token 2: starts at 20, ends at 22
+        // Word 1: starts at 20 (0.4s), ends at 22 (0.44s)
+        assert_eq!(words[1].start, 0.4);
+        assert_eq!(words[1].end, 0.44);
+        assert_eq!(words[1].probability, 0.95);
     }
 }
 
