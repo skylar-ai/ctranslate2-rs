@@ -26,4 +26,10 @@ target
 # Ignore spec-driven folders and script files
 .specs/
 scripts/lessons.py
+
+# Ignore test assets
 tests/assets/*.wav
+
+# Ignore lock files
+pixi.lock
+Cargo.lock
