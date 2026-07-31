@@ -192,7 +192,7 @@ impl Whisper {
         // Pass features through the encoder network to get encoder outputs
         let encoder_output = self.whisper.encode(&storage_view, false)?;
 
-        let prompt = self.generate_prompt(&lang_token, true);
+        let prompt = self.generate_prompt(&lang_token, false);
 
         // For alignment and timing, we do want timestamps
         let gen_results = self.whisper.generate(
