@@ -121,33 +121,9 @@ impl Whisper {
         timestamp: bool,
         options: &WhisperOptions,
     ) -> Result<Vec<String>> {
-        let mut stft = Spectrogram::new(self.config.n_fft, self.config.hop_length);
-
-        let mut mel_spectrogram_vec = vec![];
-        for chunk in samples.chunks(self.config.n_samples) {
-            let mut mel_spectrogram_per_chunk =
-                Array2::zeros((self.config.feature_size, self.config.nb_max_frames));
-            for (i, flame) in chunk.chunks(self.config.hop_length).enumerate() {
-                if let Some(fft_frame) = stft.add(flame) {
-                    let mel = norm_mel(&log_mel_spectrogram(&fft_frame, &self.config.mel_filters))
-                        .mapv(|v| v as f32);
-                    mel_spectrogram_per_chunk
-                        .slice_mut(s![.., i])
-                        .assign(&mel.slice(s![.., 0]));
-                }
-            }
-            mel_spectrogram_vec.push(mel_spectrogram_per_chunk);
-        }
-
-        let mut mel_spectrogram = stack(
-            Axis(0),
-            &mel_spectrogram_vec
-                .iter()
-                .map(|a| a.view())
-                .collect::<Vec<_>>(),
-        )?;
-        if !mel_spectrogram.is_standard_layout() {
-            mel_spectrogram = mel_spectrogram.as_standard_layout().into_owned()
+        let (mut mel_spectrogram, num_chunks) = self.generate_mel_spectrogram(samples)?;
+        if num_chunks == 0 {
+            return Ok(Vec::new());
         }
 
         let shape = mel_spectrogram.shape().to_vec();
@@ -157,33 +133,14 @@ impl Whisper {
             Default::default(),
         )?;
 
-        // Detect language.
-        let lang_token = match language {
-            Some(lang) => {
-                format!("<|{}|>", lang)
-            }
-            None => {
-                let detection_result = self.whisper.detect_language(&storage_view)?;
-                detection_result
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("failed to detect language"))?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("failed to detect language"))?
-                    .language
-            }
-        };
+        let lang_token = self.detect_language_token(&storage_view, language)?;
 
-        // Transcribe.
-        let mut prompt = vec!["<|startoftranscript|>", &lang_token, "<|transcribe|>"];
-        if !timestamp {
-            prompt.push("<|notimestamps|>");
-        }
+        let prompt = self.generate_prompt(&lang_token, timestamp);
+
         self.whisper
             .generate(
                 &storage_view,
-                &vec![prompt; mel_spectrogram_vec.len()],
+                &vec![prompt; num_chunks],
                 options,
             )?
             .into_iter()
@@ -218,37 +175,9 @@ impl Whisper {
         language: Option<&str>,
         options: &WhisperOptions,
     ) -> Result<Vec<Segment>> {
-        let mut stft = Spectrogram::new(self.config.n_fft, self.config.hop_length);
-
-        let mut mel_spectrogram_vec = vec![];
-        for chunk in samples.chunks(self.config.n_samples) {
-            let mut mel_spectrogram_per_chunk =
-                Array2::zeros((self.config.feature_size, self.config.nb_max_frames));
-            for (i, flame) in chunk.chunks(self.config.hop_length).enumerate() {
-                if let Some(fft_frame) = stft.add(flame) {
-                    let mel = norm_mel(&log_mel_spectrogram(&fft_frame, &self.config.mel_filters))
-                        .mapv(|v| v as f32);
-                    mel_spectrogram_per_chunk
-                        .slice_mut(s![.., i])
-                        .assign(&mel.slice(s![.., 0]));
-                }
-            }
-            mel_spectrogram_vec.push(mel_spectrogram_per_chunk);
-        }
-
-        if mel_spectrogram_vec.is_empty() {
+        let (mut mel_spectrogram, num_chunks) = self.generate_mel_spectrogram(samples)?;
+        if num_chunks == 0 {
             return Ok(Vec::new());
-        }
-
-        let mut mel_spectrogram = stack(
-            Axis(0),
-            &mel_spectrogram_vec
-                .iter()
-                .map(|a| a.view())
-                .collect::<Vec<_>>(),
-        )?;
-        if !mel_spectrogram.is_standard_layout() {
-            mel_spectrogram = mel_spectrogram.as_standard_layout().into_owned()
         }
 
         let shape = mel_spectrogram.shape().to_vec();
@@ -258,43 +187,34 @@ impl Whisper {
             Default::default(),
         )?;
 
-        // Detect language.
-        let lang_token = match language {
-            Some(lang) => {
-                format!("<|{}|>", lang)
-            }
-            None => {
-                let detection_result = self.whisper.detect_language(&storage_view)?;
-                detection_result
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("failed to detect language"))?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow!("failed to detect language"))?
-                    .language
-            }
-        };
+        let lang_token = self.detect_language_token(&storage_view, language)?;
 
         // Pass features through the encoder network to get encoder outputs
         let encoder_output = self.whisper.encode(&storage_view, false)?;
 
-        // Transcribe.
-        let prompt = vec!["<|startoftranscript|>", &lang_token, "<|transcribe|>"];
+        let prompt = self.generate_prompt(&lang_token, true);
+
         // For alignment and timing, we do want timestamps
         let gen_results = self.whisper.generate(
             &encoder_output,
-            &vec![prompt.clone(); mel_spectrogram_vec.len()],
+            &vec![prompt.clone(); num_chunks],
             options,
         )?;
 
         // Build start sequence token IDs for alignment FFI
-        let start_seq: Vec<usize> = prompt.iter()
-            .map(|t| self.tokenizer.token_to_id(t).map(|id| id as usize).unwrap_or(0))
+        let start_seq: Vec<usize> = prompt
+            .iter()
+            .map(|t| {
+                self.tokenizer
+                    .token_to_id(t)
+                    .map(|id| id as usize)
+                    .unwrap_or(0)
+            })
             .collect();
 
-        let num_frames = vec![self.config.nb_max_frames; mel_spectrogram_vec.len()];
-        let text_tokens: Vec<Vec<usize>> = gen_results.iter()
+        let num_frames = vec![self.config.nb_max_frames; num_chunks];
+        let text_tokens: Vec<Vec<usize>> = gen_results
+            .iter()
             .map(|res| res.sequences_ids[0].clone())
             .collect();
 
@@ -309,15 +229,23 @@ impl Whisper {
 
         let mut segments = Vec::new();
 
-        for (chunk_idx, (res, align_res)) in gen_results.iter().zip(alignment_results.iter()).enumerate() {
+        for (chunk_idx, (res, align_res)) in
+            gen_results.iter().zip(alignment_results.iter()).enumerate()
+        {
             let tokens = &res.sequences[0];
             let alignments = &align_res.alignments;
             let text_token_probs = &align_res.text_token_probs;
 
             let word_token_ranges = group_tokens_into_words(tokens);
-            let chunk_words = process_word_timings(&word_token_ranges, alignments, text_token_probs, tokens.len());
+            let chunk_words = process_word_timings(
+                &word_token_ranges,
+                alignments,
+                text_token_probs,
+                tokens.len(),
+            );
 
-            let chunk_offset = (chunk_idx * self.config.n_samples) as f32 / self.config.sampling_rate as f32;
+            let chunk_offset =
+                (chunk_idx * self.config.n_samples) as f32 / self.config.sampling_rate as f32;
 
             let mut final_words = Vec::new();
             for (range, mut word) in word_token_ranges.into_iter().zip(chunk_words.into_iter()) {
@@ -332,7 +260,8 @@ impl Whisper {
                 final_words.push(word);
             }
 
-            let clean_tokens: Vec<String> = tokens.iter()
+            let clean_tokens: Vec<String> = tokens
+                .iter()
                 .filter(|t| !is_special_token(t))
                 .cloned()
                 .collect();
@@ -391,6 +320,94 @@ impl Whisper {
     #[inline]
     pub fn num_replicas(&self) -> usize {
         self.whisper.num_replicas()
+    }
+
+    /// Generates a log-mel spectrogram for the given audio samples.
+    ///
+    /// It partitions the samples into chunks and extracts log-mel features
+    /// for each chunk.
+    ///
+    /// # Returns
+    /// A tuple containing:
+    /// - An `Array2<f32>` with the stacked log-mel spectrogram.
+    /// - The number of chunks processed.
+    fn generate_mel_spectrogram(&self, samples: &[f32]) -> Result<(Array2<f32>, usize)> {
+        let mut stft = Spectrogram::new(self.config.n_fft, self.config.hop_length);
+
+        let mut mel_spectrogram_vec = vec![];
+        for chunk in samples.chunks(self.config.n_samples) {
+            let mut mel_spectrogram_per_chunk =
+                Array2::zeros((self.config.feature_size, self.config.nb_max_frames));
+            for (i, flame) in chunk.chunks(self.config.hop_length).enumerate() {
+                if let Some(fft_frame) = stft.add(flame) {
+                    let mel = norm_mel(&log_mel_spectrogram(&fft_frame, &self.config.mel_filters))
+                        .mapv(|v| v as f32);
+                    mel_spectrogram_per_chunk
+                        .slice_mut(s![.., i])
+                        .assign(&mel.slice(s![.., 0]));
+                }
+            }
+            mel_spectrogram_vec.push(mel_spectrogram_per_chunk);
+        }
+
+        let num_chunks = mel_spectrogram_vec.len();
+        if num_chunks == 0 {
+            return Ok((Array2::zeros((0, 0)), 0));
+        }
+
+        let mut mel_spectrogram = stack(
+            Axis(0),
+            &mel_spectrogram_vec
+                .iter()
+                .map(|a| a.view())
+                .collect::<Vec<_>>(),
+        )?;
+        if !mel_spectrogram.is_standard_layout() {
+            mel_spectrogram = mel_spectrogram.as_standard_layout().into_owned();
+        }
+
+        Ok((mel_spectrogram, num_chunks))
+    }
+
+    /// Detects or formats the language token.
+    ///
+    /// If `language` is specified, it returns the formatted token (e.g. `<|en|>`).
+    /// Otherwise, it runs the language detector on the given storage view.
+    fn detect_language_token(
+        &self,
+        storage_view: &sys::StorageView,
+        language: Option<&str>,
+    ) -> Result<String> {
+        let lang_token = match language {
+            Some(lang) => {
+                format!("<|{}|>", lang)
+            }
+            None => {
+                let detection_result = self.whisper.detect_language(storage_view)?;
+                detection_result
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("failed to detect language"))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow!("failed to detect language"))?
+                    .language
+            }
+        };
+        Ok(lang_token)
+    }
+
+    /// Generates the transcript prompt tokens.
+    ///
+    /// # Arguments
+    /// * `lang_token` - The language token (e.g. `<|en|>`).
+    /// * `timestamp` - If `true`, timestamps will be generated. Otherwise, adds `"<|notimestamps|>"`.
+    fn generate_prompt<'a>(&self, lang_token: &'a str, timestamp: bool) -> Vec<&'a str> {
+        let mut prompt = vec!["<|startoftranscript|>", lang_token, "<|transcribe|>"];
+        if !timestamp {
+            prompt.push("<|notimestamps|>");
+        }
+        prompt
     }
 }
 
@@ -465,7 +482,8 @@ fn process_word_timings(
 
     // First pass: extract from alignments
     for m in 0..num_tokens {
-        let aligned_frames: Vec<i64> = alignments.iter()
+        let aligned_frames: Vec<i64> = alignments
+            .iter()
             .filter(|a| a.token_x == m as i64)
             .map(|a| a.frame_x)
             .collect();
@@ -518,7 +536,8 @@ fn process_word_timings(
     }
 
     // Apply Heuristic 2: Median-Based Duration Capping
-    let mut durations: Vec<f32> = words.iter()
+    let mut durations: Vec<f32> = words
+        .iter()
         .map(|w| w.end - w.start)
         .filter(|&d| d > 0.0)
         .collect();
@@ -574,12 +593,24 @@ mod tests_grouping {
         use crate::sys::WhisperTokenAlignment;
 
         let word_token_ranges = vec![0..2, 2..3]; // Two words: token 0..2, token 2..3
-        // Token 0 aligned to frames 10..15, Token 1 has no alignments, Token 2 aligned to frame 20..22
+                                                  // Token 0 aligned to frames 10..15, Token 1 has no alignments, Token 2 aligned to frame 20..22
         let alignments = vec![
-            WhisperTokenAlignment { token_x: 0, frame_x: 10 },
-            WhisperTokenAlignment { token_x: 0, frame_x: 14 },
-            WhisperTokenAlignment { token_x: 2, frame_x: 20 },
-            WhisperTokenAlignment { token_x: 2, frame_x: 21 },
+            WhisperTokenAlignment {
+                token_x: 0,
+                frame_x: 10,
+            },
+            WhisperTokenAlignment {
+                token_x: 0,
+                frame_x: 14,
+            },
+            WhisperTokenAlignment {
+                token_x: 2,
+                frame_x: 20,
+            },
+            WhisperTokenAlignment {
+                token_x: 2,
+                frame_x: 21,
+            },
         ];
         let text_token_probs = vec![0.9, 0.8, 0.95];
 
@@ -766,7 +797,16 @@ mod tests {
         let wav_path = std::path::Path::new("tests/assets/test.wav");
         if !wav_path.exists() {
             let output = std::process::Command::new("ffmpeg")
-                .args(&["-y", "-i", "tests/assets/test.m4a", "-ar", "16000", "-ac", "1", "tests/assets/test.wav"])
+                .args(&[
+                    "-y",
+                    "-i",
+                    "tests/assets/test.m4a",
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+                    "tests/assets/test.wav",
+                ])
                 .output()
                 .expect("failed to execute ffmpeg");
             assert!(output.status.success(), "ffmpeg conversion failed");
@@ -774,16 +814,33 @@ mod tests {
 
         let samples = read_audio(wav_path, w.sampling_rate()).unwrap();
 
-        let segments = w.transcribe(&samples, Some("en"), &Default::default()).unwrap();
-        assert!(!segments.is_empty(), "Transcribed segments should not be empty");
+        let segments = w
+            .transcribe(&samples, Some("en"), &Default::default())
+            .unwrap();
+        assert!(
+            !segments.is_empty(),
+            "Transcribed segments should not be empty"
+        );
 
         for segment in &segments {
-            println!("Segment {}: [{:.2} - {:.2}]: {}", segment.id, segment.start, segment.end, segment.text);
+            println!(
+                "Segment {}: [{:.2} - {:.2}]: {}",
+                segment.id, segment.start, segment.end, segment.text
+            );
             if let Some(words) = &segment.words {
                 for word in words {
-                    println!("  Word: '{}' [{:.2} - {:.2}] prob={:.3}", word.word, word.start, word.end, word.probability);
-                    assert!(word.start <= word.end, "Word start time must be less than or equal to end time");
-                    assert!(word.probability >= 0.0 && word.probability <= 1.0, "Word probability must be between 0.0 and 1.0");
+                    println!(
+                        "  Word: '{}' [{:.2} - {:.2}] prob={:.3}",
+                        word.word, word.start, word.end, word.probability
+                    );
+                    assert!(
+                        word.start <= word.end,
+                        "Word start time must be less than or equal to end time"
+                    );
+                    assert!(
+                        word.probability >= 0.0 && word.probability <= 1.0,
+                        "Word probability must be between 0.0 and 1.0"
+                    );
                 }
             }
         }
