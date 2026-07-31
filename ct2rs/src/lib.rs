@@ -94,7 +94,7 @@ pub use tokenizer::Tokenizer;
 pub use translator::{TranslationOptions, Translator};
 #[cfg(feature = "whisper")]
 #[cfg_attr(docsrs, doc(cfg(feature = "whisper")))]
-pub use whisper::{Whisper, WhisperOptions};
+pub use whisper::{Segment, Whisper, WhisperOptions, Word};
 
 mod generator;
 mod result;
