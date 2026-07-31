@@ -155,21 +155,21 @@ impl Whisper {
             .collect()
     }
 
-    /// Transcribe the given samples and return detailed word-level and segment-level timelines.
+    /// Generate transcription segments for the given samples with detailed word-level and segment-level timelines.
     ///
     /// # Arguments
     /// * `samples` - Samples of the source audio. They must be sampled at the sampling rate
     ///   returned by [`sampling_rate`][Whisper::sampling_rate] method and normalized to the range
     ///   `[-1, 1]`. If the samples are longer than the maximum number of samples returned by
     ///   [`n_samples`][Whisper::n_samples] method, they will be processed in segments.
-    /// * `language` - An optional language setting. It transcribes assuming the specified language.
+    /// * `language` - An optional language setting. It generates segments assuming the specified language.
     ///   If `None`, it uses Whisper's language detection.
     /// * `options` - Settings.
     ///
     /// # Returns
     /// Returns a `Result` containing a vector of transcribed `Segment`s if successful,
-    /// or an error if the transcription fails.
-    pub fn transcribe(
+    /// or an error if the segment generation fails.
+    pub fn generate_segments(
         &self,
         samples: &[f32],
         language: Option<&str>,
@@ -779,7 +779,7 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn test_whisper_transcribe() {
+    fn test_whisper_generate_segments() {
         let model_path = download_model(MODEL_ID).unwrap();
         let w = Whisper::new(
             &model_path,
@@ -815,11 +815,11 @@ mod tests {
         let samples = read_audio(wav_path, w.sampling_rate()).unwrap();
 
         let segments = w
-            .transcribe(&samples, Some("en"), &Default::default())
+            .generate_segments(&samples, Some("en"), &Default::default())
             .unwrap();
         assert!(
             !segments.is_empty(),
-            "Transcribed segments should not be empty"
+            "Generated segments should not be empty"
         );
 
         for segment in &segments {
