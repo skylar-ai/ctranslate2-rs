@@ -16,7 +16,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 use mel_spec::mel::{log_mel_spectrogram, mel, norm_mel};
 use mel_spec::stft::Spectrogram;
-use ndarray::{s, stack, Array2, Axis};
+use ndarray::{s, stack, Array2, Array3, Axis};
 use serde::{Deserialize, Serialize};
 
 pub use super::sys::WhisperOptions;
@@ -329,9 +329,9 @@ impl Whisper {
     ///
     /// # Returns
     /// A tuple containing:
-    /// - An `Array2<f32>` with the stacked log-mel spectrogram.
+    /// - An `Array3<f32>` with the stacked log-mel spectrogram.
     /// - The number of chunks processed.
-    fn generate_mel_spectrogram(&self, samples: &[f32]) -> Result<(Array2<f32>, usize)> {
+    fn generate_mel_spectrogram(&self, samples: &[f32]) -> Result<(Array3<f32>, usize)> {
         let mut stft = Spectrogram::new(self.config.n_fft, self.config.hop_length);
 
         let mut mel_spectrogram_vec = vec![];
@@ -352,7 +352,7 @@ impl Whisper {
 
         let num_chunks = mel_spectrogram_vec.len();
         if num_chunks == 0 {
-            return Ok((Array2::zeros((0, 0)), 0));
+            return Ok((Array3::zeros((0, 0, 0)), 0));
         }
 
         let mut mel_spectrogram = stack(
