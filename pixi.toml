@@ -48,3 +48,4 @@ CUDA_ARCH_LIST = "Auto"                 # Explicitly target modern architectures
 check = "nvcc --version"
 clean = "cargo clean"
 build = "cargo build --release --features cuda,cudnn"
+test = "cargo test --all --all-features"

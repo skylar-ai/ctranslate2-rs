@@ -728,10 +728,26 @@ mod tests {
         use hound::WavReader;
 
         fn resample(samples: Vec<f32>, src_rate: usize, target_rate: usize) -> Vec<f32> {
-            samples
-                .into_iter()
-                .step_by(src_rate / target_rate)
-                .collect()
+            if src_rate == target_rate {
+                return samples;
+            }
+            if src_rate > target_rate {
+                let step = src_rate / target_rate;
+                samples.into_iter().step_by(step).collect()
+            } else {
+                let factor = target_rate as f32 / src_rate as f32;
+                let new_len = (samples.len() as f32 * factor) as usize;
+                let mut resampled = Vec::with_capacity(new_len);
+                for i in 0..new_len {
+                    let src_idx = i as f32 / factor;
+                    let idx_low = src_idx.floor() as usize;
+                    let idx_high = (idx_low + 1).min(samples.len() - 1);
+                    let weight = src_idx - idx_low as f32;
+                    let val = samples[idx_low] * (1.0 - weight) + samples[idx_high] * weight;
+                    resampled.push(val);
+                }
+                resampled
+            }
         }
 
         let mut reader = WavReader::open(path)?;
@@ -796,20 +812,13 @@ mod tests {
 
         let wav_path = std::path::Path::new("tests/assets/test.wav");
         if !wav_path.exists() {
-            let output = std::process::Command::new("ffmpeg")
-                .args(&[
-                    "-y",
-                    "-i",
-                    "tests/assets/test.m4a",
-                    "-ar",
-                    "16000",
-                    "-ac",
-                    "1",
-                    "tests/assets/test.wav",
-                ])
-                .output()
-                .expect("failed to execute ffmpeg");
-            assert!(output.status.success(), "ffmpeg conversion failed");
+            if let Some(parent) = wav_path.parent() {
+                std::fs::create_dir_all(parent).expect("failed to create directory for wav file");
+            }
+            let url = "https://www.voiptroubleshooter.com/open_speech/american/OSR_us_000_0010_8k.wav";
+            let response = ureq::get(url).call().expect("failed to download wav file");
+            let mut out = std::fs::File::create(wav_path).expect("failed to create wav file");
+            std::io::copy(&mut response.into_reader(), &mut out).expect("failed to write wav file");
         }
 
         let samples = read_audio(wav_path, w.sampling_rate()).unwrap();
