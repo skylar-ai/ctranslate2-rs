@@ -28,7 +28,7 @@ target
 scripts/lessons.py
 
 # Ignore test assets
-tests/assets/*.wav
+**/tests/assets/*.wav
 
 # Ignore lock files
 pixi.lock
