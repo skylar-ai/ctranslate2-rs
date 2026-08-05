@@ -41,8 +41,8 @@ CUDAToolkit_ROOT = "$CONDA_PREFIX"
 MPI_HOME = "$CONDA_PREFIX"
 NCCL_ROOT = "$CONDA_PREFIX"
 CMAKE_PREFIX_PATH = "$CONDA_PREFIX"
-CMAKE_GENERATOR = "Ninja"               # actually use the ninja you installed
-CUDA_ARCH_LIST = "Auto"                 # Explicitly target modern architectures (Volta, Turing, Ampere, Ada Lovelace, Hopper)
+CMAKE_GENERATOR = "Ninja" # actually use the ninja you installed
+CUDA_ARCH_LIST = "Auto" # Explicitly target modern architectures (Volta, Turing, Ampere, Ada Lovelace, Hopper)
 
 [tasks]
 check = "nvcc --version"

@@ -5,9 +5,10 @@
     "indentWidth": 4
   },
   "includes": [
-    "**/Cargo.toml",
-    "**/config.toml",
-    "/README.md"
+    "**/*.{toml,md}"
+  ],
+  "excludes": [
+    "ct2rs/CTranslate2/**"
   ],
   "plugins": [
     "https://plugins.dprint.dev/markdown-0.22.1.wasm",
