@@ -26,13 +26,32 @@ build = "cargo build --release"
 test = "cargo test -- --all"
 
 [dependencies]
-cuda = ">=12.9,<13.0"
-cudnn = ">=8.9,<9.0"
+rust = "*"
+
+cuda-version = "12.9.*"
+cudnn = "8.*"
+cuda-nvcc = "*"
+libcublas-dev = "*"
+# cuda-cudart-dev = "*"
+# libcurand-dev = "*"
+
+# If WITH_TENSOR_PARALLEL
+openmpi = "*"
+nccl = "*"
+
+compilers = ">=1.8.0"
 cmake = ">=4.2.3,<5"
 ninja = ">=1.13.2,<2"
+# pkg-config = ">=0.29" <--- Why?
+
 sccache = ">=0.17.0,<0.18" #TODO we must configurate sccache ASAP!
 
 [activation.env]
 CFLAGS   = "$CFLAGS -pthread"
 CXXFLAGS = "$CXXFLAGS -pthread"
-WITH_TENSOR_PARALLEL=
+CUDA_ARCH_LIST = "Auto"
+CUDA_TOOLKIT_ROOT_DIR = "$CONDA_PREFIX"
+CUDA_PATH = "$CONDA_PREFIX"
+
+# This is test only
+WHISPER_MODEL = "$PIXI_PROJECT_ROOT/.models/faster-whisper-base"
