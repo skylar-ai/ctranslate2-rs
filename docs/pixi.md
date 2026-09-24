@@ -38,7 +38,7 @@ direnv allow
 >[!tip]
 > You can check with:
 > ```bash
-> # must be the same of `pixi run shell-hook`
+> # must be the same as `pixi run shell-hook`
 > env
 > ```
 
