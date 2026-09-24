@@ -50,8 +50,8 @@ sccache = ">=0.17.0,<0.18" #TODO we must configurate sccache ASAP!
 CFLAGS   = "$CFLAGS -pthread"
 CXXFLAGS = "$CXXFLAGS -pthread"
 CUDA_ARCH_LIST = "Auto"
-CUDA_TOOLKIT_ROOT_DIR = "$CONDA_PREFIX"
-CUDA_PATH = "$CONDA_PREFIX"
+CUDA_TOOLKIT_ROOT_DIR = "$CONDA_PREFIX/targets/x86_64-linux"
+CUDA_PATH = "$CONDA_PREFIX/targets/x86_64-linux"
 
 # This is test only
 WHISPER_MODEL = "$PIXI_PROJECT_ROOT/.models/faster-whisper-base"
