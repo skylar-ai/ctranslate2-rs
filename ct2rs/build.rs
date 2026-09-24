@@ -64,7 +64,7 @@ fn build_ctranslate2() {
     let mut openmp_comp: bool = cfg!(feature = "openmp-runtime-comp");
     let openmp_intel = cfg!(feature = "openmp-runtime-intel");
     let sse4_1 = cfg!(target_feature = "sse4.1");
-    if !openmp_intel && openmp_comp && dnnl {
+    if !openmp_intel && !openmp_comp && dnnl {
         if os == Os::Linux {
             openmp_comp = true;
         }
