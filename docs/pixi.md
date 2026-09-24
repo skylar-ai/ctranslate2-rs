@@ -1,9 +1,48 @@
-Pixi Issues
------------
+Using Pixi & direnv
+-------------------
 
 > You must have an NVIDIA GPU on your machine and you must install the CUDA drivers. The CUDA driver cannot be installed with conda and must be installed on your system using an appropriate installation method. [Reference](https://conda-forge.org/docs/maintainer/knowledge_base/#prerequisites).
 
-# Setup
+- [Pixi Homepage](https://pixi.prefix.dev/latest/)
+- [direnv](https://direnv.net/)
+
+A development environment with `pixi` and `direnv` is very useful because it provides a self-contained, reproducible native build toolchain without requiring root privileges or polluting host system directories:
+
+- **Isolated native & CUDA toolchain:** It pins and installs all native dependencies (CMake, Ninja, GCC, CUDA nvcc, cuDNN, NCCL, OpenMPI) alongside Rust in a local `.pixi/` directory, requiring only the base NVIDIA display driver on the host system.
+- **Seamless shell & editor integration:** With `direnv`, all environment variables (`$PATH`, `$CONDA_PREFIX`, `$CUDA_TOOLKIT_ROOT_DIR`, and compiler flags) are automatically activated whenever you enter the project directory. This ensures IDEs and language servers (like `rust-analyzer` in Zed or VS Code) immediately find the correct compilers and headers without extra wrapper scripts.
+- **Deterministic builds:** The `pixi.lock` file guarantees that every contributor and CI pipeline builds against identical versions of native C++ and CUDA libraries, eliminating "works on my machine" inconsistencies.
+
+>[!tip]
+> [direnv](https://direnv.net/)
+> ```bash
+> pixi global install direnv
+> ```
+> 
+> ```bash
+> if [ -d "$HOME/.pixi/bin" ] ; then
+>     export PATH="$HOME/.pixi/bin:$PATH"
+> fi
+> ```
+
+# Seting up the environment
+
+After cloning the repository:
+```bash
+cd ctranslate2-rs
+
+pixi install
+
+direnv allow
+```
+
+>[!tip]
+> You can check with:
+> ```bash
+> # must be the same of `pixi run shell-hook`
+> env
+> ```
+
+# Pixi Issues
 
 Move from full `cuda` (`coda-forge`) to minimal dependencies:
 
@@ -20,7 +59,7 @@ cuda-nvcc = "*"
 libcublas-dev = "*"
 ```
 
-# NCCL and MPI > tensor-parallel
+## NCCL and MPI > tensor-parallel
 [NCCL](https://developer.nvidia.com/nccl)
 
 The `CTranslate2` requires `NCCL` and `MPI` to build (line 500-502).
@@ -31,28 +70,9 @@ if (WITH_TENSOR_PARALLEL)
   find_package(NCCL REQUIRED)
 ```
 
-# Multiple `cuda.h`
+## NVIDIA Headers
 
-```bash
-~/ctranslate2-rs$ find .pixi/envs/default/ -name cuda.h
-.pixi/envs/default/x86_64-conda-linux-gnu/sysroot/usr/include/linux/cuda.h
-.pixi/envs/default/targets/x86_64-linux/include/cuda.h
-.pixi/envs/default/include/hwloc/cuda.h
-```
-
-Those three `cuda.h` files are **not** duplicate installations of NVIDIA CUDA, and it is **not a bug in conda-forge**. 
-
-### Breakdown of the 3 files
-
-| File Path | Package | What it actually is |
-| :--- | :--- | :--- |
-| `sysroot/usr/include/linux/cuda.h` | `sysroot_linux-64` | **Linux kernel header for Apple hardware (1996)** |
-| `include/hwloc/cuda.h` | `openmpi` / `libhwloc` | **Hardware Locality helper header** |
-| `targets/x86_64-linux/include/cuda.h` | `cuda-cudart-dev` | **The real NVIDIA CUDA header** |
-
-### Why does conda-forge put it in `targets/x86_64-linux/`?
-
-Starting with CUDA 11 and 12, NVIDIA distributes the CUDA Toolkit as modular redistributable packages. NVIDIA uses a target-architecture layout to support cross-compilation:
+NVIDIA distributes the CUDA Toolkit as modular redistributable packages. NVIDIA uses a target-architecture layout to support cross-compilation:
 
 ```text
 $CONDA_PREFIX/targets/
@@ -66,26 +86,6 @@ Conda-forge packages NVIDIA's official redistributables directly using NVIDIA's 
 -I$CONDA_PREFIX/targets/x86_64-linux/include
 -L$CONDA_PREFIX/targets/x86_64-linux/lib
 ```
-
----
-
-### How this affects your `pixi.toml` and `build.rs`
-
-Notice what you currently have in `pixi.toml`:
-
-```toml
-[activation.env]
-CUDA_TOOLKIT_ROOT_DIR = "$CONDA_PREFIX"
-CUDA_PATH = "$CONDA_PREFIX"
-```
-
-The Rust build script (`ct2rs/build.rs`) checks:
-```rust
-path.join("include").join("cuda.h").is_file()
-```
-Because `$CONDA_PREFIX/include/cuda.h` does not exist (it is at `$CONDA_PREFIX/targets/x86_64-linux/include/cuda.h`), `ct2rs` fails to detect CUDA under `$CONDA_PREFIX`.
-
-To fix this, update your `pixi.toml` activation environment to:
 
 ```toml
 [activation.env]
