@@ -436,7 +436,9 @@ fn is_library(name: &&str) -> bool {
 
 #[cfg(not(target_os = "windows"))]
 fn library_name(name: &str) -> &str {
-    &name[3..name.len() - 2]
+    name.strip_prefix("lib")
+        .and_then(|s| s.strip_suffix(".a"))
+        .unwrap_or(name)
 }
 
 #[cfg(target_os = "windows")]
@@ -446,7 +448,7 @@ fn is_library(name: &&str) -> bool {
 
 #[cfg(target_os = "windows")]
 fn library_name(name: &str) -> &str {
-    &name[0..name.len() - 4]
+    name.strip_suffix(".lib").unwrap_or(name)
 }
 
 fn link_libraries<T: AsRef<Path>>(root: T) {

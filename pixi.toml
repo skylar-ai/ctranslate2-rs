@@ -27,22 +27,16 @@ test = "cargo test -- --all"
 
 [dependencies]
 rust = "*"
+rust-src = ">=1.98.1,<2"
 
 cuda-version = "12.9.*"
 cudnn = "8.*"
 cuda-nvcc = "*"
 libcublas-dev = "*"
-# cuda-cudart-dev = "*"
-# libcurand-dev = "*"
-
-# If WITH_TENSOR_PARALLEL
-openmpi = "*"
-nccl = "*"
 
 compilers = ">=1.8.0"
 cmake = ">=4.2.3,<5"
 ninja = ">=1.13.2,<2"
-# pkg-config = ">=0.29" <--- Why?
 
 sccache = ">=0.17.0,<0.18" #TODO we must configurate sccache ASAP!
 
@@ -55,3 +49,12 @@ CUDA_PATH = "$CONDA_PREFIX/targets/x86_64-linux"
 
 # This is test only
 WHISPER_MODEL = "$PIXI_PROJECT_ROOT/.models/faster-whisper-base"
+
+[environments]
+default = []
+#TODO this must be completed with all dependencies required by `ct2rs-platform`
+platform = ["tensor-parallel"]
+
+[feature.tensor-parallel.dependencies]
+openmpi = "*"
+nccl = "*"

@@ -1,6 +1,7 @@
 [workspace]
-members = ["ct2rs", "ct2rs-platform"]
-default-members = ["ct2rs"]
+members = ["ct2rs"]
+# By default, `ct2rs-platform` is excluded.
+exclude = ["ct2rs-platform"]
 resolver = "2"
 
 [workspace.package]
