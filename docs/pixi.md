@@ -24,7 +24,7 @@ A development environment with `pixi` and `direnv` is very useful because it pro
 > fi
 > ```
 
-# Seting up the environment
+# Setting up the environment
 
 After cloning the repository:
 ```bash
