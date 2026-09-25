@@ -1,9 +1,11 @@
 [workspace]
-members = ["ct2rs", "ct2rs-platform"]
+members = ["ct2rs"]
+# By default, `ct2rs-platform` is excluded.
+exclude = ["ct2rs-platform"]
 resolver = "2"
 
 [workspace.package]
-version = "0.10.0"
+version = "0.10.1"
 authors = ["Junpei Kawamoto <kawamoto.junpei@gmail.com>"]
 edition = "2021"
 license = "MIT"
