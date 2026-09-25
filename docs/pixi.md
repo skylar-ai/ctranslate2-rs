@@ -8,7 +8,7 @@ Using Pixi & direnv
 
 A development environment with `pixi` and `direnv` is very useful because it provides a self-contained, reproducible native build toolchain without requiring root privileges or polluting host system directories:
 
-- **Isolated native & CUDA toolchain:** It pins and installs all native dependencies (CMake, Ninja, GCC, CUDA nvcc, cuDNN, NCCL, OpenMPI) alongside Rust in a local `.pixi/` directory, requiring only the base NVIDIA display driver on the host system.
+- **Isolated native & CUDA toolchain:** It pins and installs native dependencies (CMake, Ninja, compilers, CUDA nvcc, and cuDNN) alongside Rust in a local `.pixi/` directory; the optional `platform` environment adds NCCL and OpenMPI.
 - **Seamless shell & editor integration:** With `direnv`, all environment variables (`$PATH`, `$CONDA_PREFIX`, `$CUDA_TOOLKIT_ROOT_DIR`, and compiler flags) are automatically activated whenever you enter the project directory. This ensures IDEs and language servers (like `rust-analyzer` in Zed or VS Code) immediately find the correct compilers and headers without extra wrapper scripts.
 - **Deterministic builds:** The `pixi.lock` file guarantees that every contributor and CI pipeline builds against identical versions of native C++ and CUDA libraries, eliminating "works on my machine" inconsistencies.
 
