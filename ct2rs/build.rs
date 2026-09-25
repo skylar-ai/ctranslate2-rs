@@ -436,7 +436,9 @@ fn is_library(name: &&str) -> bool {
 
 #[cfg(not(target_os = "windows"))]
 fn library_name(name: &str) -> &str {
-    &name[0..name.len() - 4]
+    name.strip_prefix("lib")
+        .and_then(|s| s.strip_suffix(".a"))
+        .unwrap_or(name)
 }
 
 #[cfg(target_os = "windows")]

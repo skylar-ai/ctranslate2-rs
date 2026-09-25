@@ -44,7 +44,7 @@ direnv allow
 
 # Pixi Issues
 
-Move from full `cuda` (`coda-forge`) to minimal dependencies:
+Move from full `cuda` (`conda-forge`) to minimal dependencies:
 
 ```toml
 [dependencies]

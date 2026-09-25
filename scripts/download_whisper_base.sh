@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download Whisper model weights for testing and local development at `./models`
+# Download Whisper model weights for testing and local development at `./.models`
 set -euo pipefail
 
 # Determine repository root regardless of where the script is executed from
