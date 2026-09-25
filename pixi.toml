@@ -23,7 +23,6 @@ compilers = ["rust", "c", "cxx"]
 clean = "cargo clean"
 check = "cargo check"
 build = "cargo build --release"
-test = "cargo test -- --all"
 test = "cargo test --workspace"
 
 [dependencies]
@@ -39,7 +38,7 @@ compilers = ">=1.8.0"
 cmake = ">=4.2.3,<5"
 ninja = ">=1.13.2,<2"
 
-sccache = ">=0.17.0,<0.18" #TODO we must configurate sccache ASAP!
+sccache = ">=0.17.0,<0.18" # TODO we must configurate sccache ASAP!
 
 [activation.env]
 CFLAGS   = "$CFLAGS -pthread"
@@ -50,7 +49,7 @@ CUDA_PATH = "$CONDA_PREFIX/targets/x86_64-linux"
 
 [environments]
 default = []
-#TODO this must be completed with all dependencies required by `ct2rs-platform`
+# TODO this must be completed with all dependencies required by `ct2rs-platform`
 platform = ["tensor-parallel"]
 
 [feature.tensor-parallel.dependencies]
