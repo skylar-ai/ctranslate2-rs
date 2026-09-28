@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 use super::tokenizers::hf;
 use super::{sys, Config, Tokenizer};
 
+mod conditioning;
+mod reconciliation;
+
 /// Represents a transcribed word with detailed timing and probability.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Word {
@@ -57,6 +60,13 @@ pub struct Segment {
 /// `initial_prompt`/`hotwords`, which only [`Whisper::generate_segments`] consumes to bias
 /// transcription. Both default to `None`, so existing callers relying on `..Default::default()`
 /// see no behavior change at all.
+///
+/// The field-for-field mirror (rather than wrapping [`sys::WhisperOptions`]) is required, not
+/// incidental: cxx shared structs can't carry `Option<String>` fields, so `initial_prompt`/
+/// `hotwords` can't live on `sys::WhisperOptions` itself. Mirroring the fields here, instead of
+/// nesting `sys::WhisperOptions` inside this struct, keeps flat struct-literal construction (e.g.
+/// `WhisperOptions { beam_size: 10, ..Default::default() }`) working exactly as it did before
+/// these two fields existed.
 ///
 /// # Examples
 ///
@@ -115,7 +125,7 @@ pub struct WhisperOptions {
     /// Conditioning is a soft bias on decoding: `generate_segments` decodes each chunk both with
     /// and without it and reconciles the two transcripts word by word, keeping a conditioned
     /// word only where it's an improvement and never accepting content conditioning dropped
-    /// outright (see [`Whisper::generate_segments`] and `merge_word_hypotheses`).
+    /// outright (see [`Whisper::generate_segments`]).
     pub initial_prompt: Option<String>,
     /// Optional hint words/phrases biasing decoding toward specific vocabulary or spellings.
     /// Consumed only by [`Whisper::generate_segments`], which tokenizes it once and prepends it
@@ -370,180 +380,6 @@ impl Whisper {
         )
     }
 
-    /// Decodes and aligns a single prompt for every chunk, with no conditioning involved. This is
-    /// the path used whenever `initial_prompt`/`hotwords` are both `None`.
-    fn generate_segments_plain(
-        &self,
-        encoder_output: &sys::StorageView,
-        prompt: &[String],
-        num_chunks: usize,
-        options: &WhisperOptions,
-    ) -> Result<Vec<Segment>> {
-        let gen_results = self.whisper.generate(
-            encoder_output,
-            &vec![prompt.to_vec(); num_chunks],
-            &sys::WhisperOptions::from(options),
-        )?;
-        let alignment_results =
-            self.align_chunks(encoder_output, prompt, &gen_results, num_chunks)?;
-
-        let mut segments = Vec::with_capacity(num_chunks);
-        for (chunk_idx, (res, align_res)) in
-            gen_results.iter().zip(alignment_results.iter()).enumerate()
-        {
-            let chunk_offset =
-                (chunk_idx * self.config.n_samples) as f32 / self.config.sampling_rate as f32;
-            let tokens = &res.sequences[0];
-
-            // `tokens` (`res.sequences[0]`) never echoes back the forced prompt beyond its
-            // single trailing task token (`<|transcribe|>`/`<|notimestamps|>`). CTranslate2
-            // feeds everything before that purely through the decoder's KV cache and only
-            // returns the newly generated continuation (see `WhisperReplica::generate` in
-            // `CTranslate2/src/models/whisper.cc`). That leading task token is filtered out
-            // below like any other special token.
-            let words = self.words_from_tokens(tokens, align_res, chunk_offset)?;
-
-            let clean_tokens: Vec<String> = tokens
-                .iter()
-                .filter(|t| !is_special_token(t))
-                .cloned()
-                .collect();
-            let chunk_text = self.tokenizer.decode(clean_tokens)?.trim().to_string();
-
-            let seg_start = words.first().map(|w| w.start).unwrap_or(chunk_offset);
-            let seg_end = words.last().map(|w| w.end).unwrap_or(chunk_offset);
-
-            segments.push(Segment {
-                id: chunk_idx,
-                text: chunk_text,
-                start: seg_start,
-                end: seg_end,
-                words: Some(words),
-            });
-        }
-
-        Ok(segments)
-    }
-
-    /// Decodes every chunk with both the conditioned and the plain prompt, then reconciles the
-    /// two transcripts word by word instead of picking one whole chunk as the winner.
-    ///
-    /// Forced-prompt conditioning biases the whole decode trajectory, not just the target word,
-    /// so on real audio it can occasionally derail unrelated content elsewhere in the same chunk.
-    /// A whole-chunk "keep whichever scored better" comparison would still accept that collateral
-    /// damage as long as the rest of the chunk improved enough to raise its average score.
-    /// Reconciling word by word (see [`merge_word_hypotheses`]) avoids that: matching words are
-    /// kept as-is, a word conditioning changed is kept only if its local confidence improved, and
-    /// content conditioning dropped entirely is never accepted silently: the baseline's words
-    /// are used for that span instead.
-    ///
-    /// Cost: roughly 2x decode and 2x alignment work for chunks that use conditioning (nothing
-    /// extra when `initial_prompt`/`hotwords` aren't set, since this path isn't taken then).
-    fn generate_segments_with_conditioning(
-        &self,
-        encoder_output: &sys::StorageView,
-        baseline_prompt: &[String],
-        conditioned_prompt: &[String],
-        num_chunks: usize,
-        options: &WhisperOptions,
-    ) -> Result<Vec<Segment>> {
-        let ffi_options = sys::WhisperOptions::from(options);
-
-        // These must be two separate `generate()` calls, not one batch of both prompt kinds:
-        // CTranslate2 requires every prompt within a single batch to have
-        // `<|startoftranscript|>` at the same index, which the conditioned prompt (longer,
-        // prefixed with the conditioning tokens) and the plain prompt (unprefixed) don't share.
-        let conditioned_results = self.whisper.generate(
-            encoder_output,
-            &vec![conditioned_prompt.to_vec(); num_chunks],
-            &ffi_options,
-        )?;
-        let baseline_results = self.whisper.generate(
-            encoder_output,
-            &vec![baseline_prompt.to_vec(); num_chunks],
-            &ffi_options,
-        )?;
-
-        // Each candidate is aligned with its own matching prompt, so word-level confidence
-        // (used by `merge_word_hypotheses` below) is measured fairly for both, not skewed by
-        // forcing one candidate's words through the other's decoder context.
-        let conditioned_alignments = self.align_chunks(
-            encoder_output,
-            conditioned_prompt,
-            &conditioned_results,
-            num_chunks,
-        )?;
-        let baseline_alignments = self.align_chunks(
-            encoder_output,
-            baseline_prompt,
-            &baseline_results,
-            num_chunks,
-        )?;
-
-        let mut segments = Vec::with_capacity(num_chunks);
-        for chunk_idx in 0..num_chunks {
-            let chunk_offset =
-                (chunk_idx * self.config.n_samples) as f32 / self.config.sampling_rate as f32;
-
-            let cond_words = self.words_from_tokens(
-                &conditioned_results[chunk_idx].sequences[0],
-                &conditioned_alignments[chunk_idx],
-                chunk_offset,
-            )?;
-            let base_words = self.words_from_tokens(
-                &baseline_results[chunk_idx].sequences[0],
-                &baseline_alignments[chunk_idx],
-                chunk_offset,
-            )?;
-
-            let words = merge_word_hypotheses(&base_words, &cond_words);
-            let seg_start = words.first().map(|w| w.start).unwrap_or(chunk_offset);
-            let seg_end = words.last().map(|w| w.end).unwrap_or(chunk_offset);
-            let text = join_words(&words);
-
-            segments.push(Segment {
-                id: chunk_idx,
-                text,
-                start: seg_start,
-                end: seg_end,
-                words: Some(words),
-            });
-        }
-
-        Ok(segments)
-    }
-
-    /// Extracts word-level text, timing and per-word confidence for one chunk from its decoded
-    /// tokens and matching DTW alignment.
-    fn words_from_tokens(
-        &self,
-        tokens: &[String],
-        align_res: &sys::WhisperAlignmentResult,
-        chunk_offset: f32,
-    ) -> Result<Vec<Word>> {
-        let word_token_ranges = group_tokens_into_words(tokens);
-        let chunk_words = process_word_timings(
-            &word_token_ranges,
-            &align_res.alignments,
-            &align_res.text_token_probs,
-            tokens.len(),
-        );
-
-        let mut final_words = Vec::new();
-        for (range, mut word) in word_token_ranges.into_iter().zip(chunk_words.into_iter()) {
-            let word_text = self.tokenizer.decode(tokens[range.clone()].to_vec())?;
-            let clean_word_text = word_text.trim().to_string();
-            if clean_word_text.is_empty() {
-                continue;
-            }
-            word.word = clean_word_text;
-            word.start += chunk_offset;
-            word.end += chunk_offset;
-            final_words.push(word);
-        }
-        Ok(final_words)
-    }
-
     /// Returns the expected sampling rate.
     pub fn sampling_rate(&self) -> usize {
         self.config.sampling_rate
@@ -670,94 +506,6 @@ impl Whisper {
             prompt.push("<|notimestamps|>");
         }
         prompt
-    }
-
-    /// Builds the `<|startofprev|>`-prefixed conditioning tokens for `hotwords`/`initial_prompt`,
-    /// mirroring faster-whisper's `get_prompt` token order and length-capping semantics, but
-    /// applied identically to every chunk (no rolling previous-text conditioning). Returns an
-    /// empty vector if neither is provided, in which case callers see no behavior change at all.
-    fn build_conditioning_prefix(
-        &self,
-        initial_prompt: Option<&str>,
-        hotwords: Option<&str>,
-        max_length: usize,
-    ) -> Result<Vec<String>> {
-        if initial_prompt.is_none() && hotwords.is_none() {
-            return Ok(Vec::new());
-        }
-
-        let mut prefix = vec!["<|startofprev|>".to_string()];
-
-        if let Some(hw) = hotwords {
-            prefix.extend(cap_head(self.encode_raw(hw)?, max_length));
-        }
-        if let Some(prompt) = initial_prompt {
-            prefix.extend(cap_tail(self.encode_raw(prompt)?, max_length));
-        }
-
-        Ok(prefix)
-    }
-
-    /// Encodes free text into raw BPE token piece strings, bypassing the wrapping
-    /// `hf::Tokenizer`'s special-token template (we only want the plain content pieces, not the
-    /// model's own start/end-of-sequence tokens injected around them). Uses faster-whisper's
-    /// leading-space convention (`" " + text.trim()`) for consistent piece boundaries.
-    fn encode_raw(&self, text: &str) -> Result<Vec<String>> {
-        let with_leading_space = format!(" {}", text.trim());
-        (*self.tokenizer)
-            .encode(with_leading_space.as_str(), false)
-            .map(|encoding| encoding.get_tokens().to_vec())
-            .map_err(|err| anyhow!("failed to encode conditioning text: {err}"))
-    }
-
-    /// Runs DTW alignment for a batch of chunks that were all decoded from the same forced
-    /// `prompt` (`align()` applies one shared `start_sequence` to its whole batch, so chunks
-    /// decoded with different prompts must go through separate calls).
-    fn align_chunks(
-        &self,
-        encoder_output: &sys::StorageView,
-        prompt: &[String],
-        gen_results: &[sys::WhisperGenerationResult],
-        num_chunks: usize,
-    ) -> Result<Vec<sys::WhisperAlignmentResult>> {
-        let start_seq: Vec<usize> = prompt
-            .iter()
-            .map(|t| {
-                self.tokenizer
-                    .token_to_id(t)
-                    .map(|id| id as usize)
-                    .unwrap_or(0)
-            })
-            .collect();
-        let num_frames = vec![self.config.nb_max_frames; num_chunks];
-        let text_tokens: Vec<Vec<usize>> = gen_results
-            .iter()
-            .map(|res| res.sequences_ids[0].clone())
-            .collect();
-
-        self.whisper
-            .align(encoder_output, &start_seq, &text_tokens, &num_frames, 7)
-    }
-}
-
-/// Hotwords are head-truncated when too long: keep only the first `max_length/2 - 1` tokens,
-/// matching faster-whisper's `hotwords_tokens[: max_length // 2 - 1]`.
-fn cap_head(mut tokens: Vec<String>, max_length: usize) -> Vec<String> {
-    let threshold = max_length / 2;
-    if tokens.len() >= threshold {
-        tokens.truncate(threshold.saturating_sub(1));
-    }
-    tokens
-}
-
-/// `initial_prompt` tokens are tail-kept when too long: keep only the last `max_length/2 - 1`
-/// tokens, matching faster-whisper's `previous_tokens[-(max_length // 2 - 1):]`.
-fn cap_tail(tokens: Vec<String>, max_length: usize) -> Vec<String> {
-    let keep = (max_length / 2).saturating_sub(1);
-    if tokens.len() > keep {
-        tokens[tokens.len() - keep..].to_vec()
-    } else {
-        tokens
     }
 }
 
@@ -910,179 +658,6 @@ fn process_word_timings(
     words
 }
 
-/// One elementary edit-script operation aligning a `base` word sequence to a `cond` one, with
-/// the index (or indices) of the word(s) it consumes from each side.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WordEditOp {
-    /// Same word (case-insensitively) on both sides.
-    Match(usize, usize),
-    /// Different word at this position on both sides.
-    Substitute(usize, usize),
-    /// A word present in `base` with nothing corresponding in `cond`.
-    Delete(usize),
-    /// A word present in `cond` with nothing corresponding in `base`.
-    Insert(usize),
-}
-
-/// Computes a minimal word-level edit script aligning `base` to `cond` (Levenshtein alignment,
-/// comparing word text case-insensitively). `O(base.len() * cond.len())`, which is trivial at
-/// the scale of one ~30s chunk's word count.
-fn word_edit_script(base: &[Word], cond: &[Word]) -> Vec<WordEditOp> {
-    let n = base.len();
-    let m = cond.len();
-
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
-    for (i, row) in dp.iter_mut().enumerate() {
-        row[0] = i as u32;
-    }
-    for j in 0..=m {
-        dp[0][j] = j as u32;
-    }
-    for i in 1..=n {
-        for j in 1..=m {
-            let sub_cost = if base[i - 1].word.eq_ignore_ascii_case(&cond[j - 1].word) {
-                0
-            } else {
-                1
-            };
-            dp[i][j] = (dp[i - 1][j - 1] + sub_cost)
-                .min(dp[i - 1][j] + 1)
-                .min(dp[i][j - 1] + 1);
-        }
-    }
-
-    let mut ops = Vec::with_capacity(n.max(m));
-    let (mut i, mut j) = (n, m);
-    while i > 0 || j > 0 {
-        if i > 0 && j > 0 {
-            let sub_cost = if base[i - 1].word.eq_ignore_ascii_case(&cond[j - 1].word) {
-                0
-            } else {
-                1
-            };
-            if dp[i][j] == dp[i - 1][j - 1] + sub_cost {
-                ops.push(if sub_cost == 0 {
-                    WordEditOp::Match(i - 1, j - 1)
-                } else {
-                    WordEditOp::Substitute(i - 1, j - 1)
-                });
-                i -= 1;
-                j -= 1;
-                continue;
-            }
-        }
-        if i > 0 && dp[i][j] == dp[i - 1][j] + 1 {
-            ops.push(WordEditOp::Delete(i - 1));
-            i -= 1;
-            continue;
-        }
-        ops.push(WordEditOp::Insert(j - 1));
-        j -= 1;
-    }
-    ops.reverse();
-    ops
-}
-
-/// Reconciles two word-level transcripts of the same audio chunk, one decoded without
-/// `initial_prompt`/`hotwords` conditioning (`base`) and one with it (`cond`), word by word
-/// rather than picking one whole transcript as the winner.
-///
-/// Policy per aligned block between two matching anchor words (see [`word_edit_script`]):
-/// - Both sides agree: kept as-is.
-/// - `cond` added words `base` didn't have (pure insertion): kept, since conditioning
-///   contributing extra content it's confident about is not a risk worth guarding against.
-/// - `base` has words `cond` doesn't (pure deletion): **`base`'s words are always kept**.
-///   Conditioning silently dropping content is the one failure mode this function exists to
-///   prevent, and there is no "confidence of an absence" to weigh it against, so it is never
-///   accepted.
-/// - Both sides have different words at the same position (replace): whichever side's local
-///   average word probability is higher is kept, so a conditioned word only overrides the
-///   baseline when the model is actually more confident in it, not merely because the prompt
-///   nudged it there.
-fn merge_word_hypotheses(base: &[Word], cond: &[Word]) -> Vec<Word> {
-    let ops = word_edit_script(base, cond);
-    let mut merged = Vec::with_capacity(ops.len());
-
-    let mut idx = 0;
-    while idx < ops.len() {
-        if let WordEditOp::Match(_, cond_idx) = ops[idx] {
-            merged.push(cond[cond_idx].clone());
-            idx += 1;
-            continue;
-        }
-
-        let start = idx;
-        while idx < ops.len() && !matches!(ops[idx], WordEditOp::Match(..)) {
-            idx += 1;
-        }
-
-        let mut base_range: Option<(usize, usize)> = None;
-        let mut cond_range: Option<(usize, usize)> = None;
-        for op in &ops[start..idx] {
-            match *op {
-                WordEditOp::Substitute(bi, ci) => {
-                    base_range = Some(extend_range(base_range, bi));
-                    cond_range = Some(extend_range(cond_range, ci));
-                }
-                WordEditOp::Delete(bi) => base_range = Some(extend_range(base_range, bi)),
-                WordEditOp::Insert(ci) => cond_range = Some(extend_range(cond_range, ci)),
-                WordEditOp::Match(..) => unreachable!("matches are handled above"),
-            }
-        }
-
-        match (base_range, cond_range) {
-            (Some((lo, hi)), None) => merged.extend(base[lo..=hi].iter().cloned()),
-            (None, Some((lo, hi))) => merged.extend(cond[lo..=hi].iter().cloned()),
-            (Some((base_lo, base_hi)), Some((cond_lo, cond_hi))) => {
-                let base_slice = &base[base_lo..=base_hi];
-                let cond_slice = &cond[cond_lo..=cond_hi];
-                if average_probability(cond_slice) >= average_probability(base_slice) {
-                    merged.extend(cond_slice.iter().cloned());
-                } else {
-                    merged.extend(base_slice.iter().cloned());
-                }
-            }
-            (None, None) => unreachable!("a non-match run must consume at least one side"),
-        }
-    }
-
-    merged
-}
-
-fn extend_range(range: Option<(usize, usize)>, idx: usize) -> (usize, usize) {
-    match range {
-        Some((lo, hi)) => (lo.min(idx), hi.max(idx)),
-        None => (idx, idx),
-    }
-}
-
-fn average_probability(words: &[Word]) -> f32 {
-    if words.is_empty() {
-        return 0.0;
-    }
-    words.iter().map(|w| w.probability).sum::<f32>() / words.len() as f32
-}
-
-/// Joins word-level output back into display text, matching common detokenization practice: no
-/// space is inserted before a "word" that is pure punctuation (e.g. `,`, `.`, `!`).
-fn join_words(words: &[Word]) -> String {
-    let mut text = String::new();
-    for w in words {
-        if !text.is_empty() && starts_with_alphanumeric(&w.word) {
-            text.push(' ');
-        }
-        text.push_str(&w.word);
-    }
-    text
-}
-
-/// Whether a word should get a leading space when joined after another. Words starting with
-/// punctuation (`,`, `!`, or a split-off contraction piece like `'t` in "don't") attach directly
-/// to what precedes them instead.
-fn starts_with_alphanumeric(word: &str) -> bool {
-    word.chars().next().is_some_and(|c| c.is_alphanumeric())
-}
-
 #[cfg(test)]
 mod tests_grouping {
     use super::*;
@@ -1112,149 +687,12 @@ mod tests_grouping {
     }
 
     #[test]
-    fn test_cap_head_truncates_hotwords_tokens() {
-        let tokens: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
-        let capped = cap_head(tokens, 20); // threshold = 10, keep = 9
-        assert_eq!(capped.len(), 9);
-        assert_eq!(capped[0], "t0");
-    }
-
-    #[test]
-    fn test_cap_head_leaves_short_hotwords_untouched() {
-        let tokens: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
-        assert_eq!(cap_head(tokens.clone(), 20), tokens);
-    }
-
-    #[test]
-    fn test_cap_tail_keeps_last_tokens_of_initial_prompt() {
-        let tokens: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
-        let capped = cap_tail(tokens, 20); // keep = 9
-        assert_eq!(capped.len(), 9);
-        assert_eq!(capped[0], "t11");
-    }
-
-    #[test]
-    fn test_cap_tail_leaves_short_prompt_untouched() {
-        let tokens: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
-        assert_eq!(cap_tail(tokens.clone(), 20), tokens);
-    }
-
-    #[test]
     fn test_default_whisper_options_has_no_conditioning() {
         let options = super::WhisperOptions::default();
         assert!(options.initial_prompt.is_none());
         assert!(options.hotwords.is_none());
         assert_eq!(options.beam_size, 5);
         assert_eq!(options.max_length, 448);
-    }
-
-    fn word(text: &str, probability: f32) -> Word {
-        Word {
-            word: text.to_string(),
-            start: 0.0,
-            end: 0.0,
-            probability,
-        }
-    }
-
-    fn words(pairs: &[(&str, f32)]) -> Vec<Word> {
-        pairs.iter().map(|&(w, p)| word(w, p)).collect()
-    }
-
-    #[test]
-    fn test_merge_word_hypotheses_keeps_matching_words() {
-        let base = words(&[("hello", 0.5), ("world", 0.5)]);
-        let cond = words(&[("hello", 0.9), ("world", 0.9)]);
-        let merged = merge_word_hypotheses(&base, &cond);
-        let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
-        assert_eq!(text, vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn test_merge_word_hypotheses_never_accepts_a_dropped_clause() {
-        // `cond` drops "wonderful strange" entirely relative to `base`. This must never be
-        // accepted silently, regardless of confidence, since there is nothing on the `cond`
-        // side to compare it against.
-        let base = words(&[
-            ("this", 0.9),
-            ("is", 0.9),
-            ("a", 0.9),
-            ("wonderful", 0.9),
-            ("strange", 0.9),
-            ("day", 0.9),
-        ]);
-        let cond = words(&[("this", 0.9), ("is", 0.9), ("a", 0.9), ("day", 0.9)]);
-        let merged = merge_word_hypotheses(&base, &cond);
-        let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
-        assert_eq!(text, vec!["this", "is", "a", "wonderful", "strange", "day"]);
-    }
-
-    #[test]
-    fn test_merge_word_hypotheses_keeps_higher_confidence_replacement() {
-        // `cond` replaces "world" with a lower-confidence "word": keep `base`'s word.
-        let base = words(&[("hello", 0.9), ("world", 0.85)]);
-        let cond = words(&[("hello", 0.9), ("word", 0.2)]);
-        let merged = merge_word_hypotheses(&base, &cond);
-        let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
-        assert_eq!(text, vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn test_merge_word_hypotheses_prefers_higher_confidence_conditioned_word() {
-        // `cond` replaces a garbled word with a correctly-spelled, higher-confidence one: keep
-        // `cond`'s word, i.e. the hotwords use case.
-        let base = words(&[("hello", 0.9), ("wrld", 0.3)]);
-        let cond = words(&[("hello", 0.9), ("world", 0.95)]);
-        let merged = merge_word_hypotheses(&base, &cond);
-        let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
-        assert_eq!(text, vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn test_merge_word_hypotheses_keeps_pure_insertion() {
-        let base = words(&[("hello", 0.9), ("world", 0.9)]);
-        let cond = words(&[("hello", 0.9), ("there", 0.9), ("world", 0.9)]);
-        let merged = merge_word_hypotheses(&base, &cond);
-        let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
-        assert_eq!(text, vec!["hello", "there", "world"]);
-    }
-
-    #[test]
-    fn test_merge_word_hypotheses_empty_base_keeps_all_conditioned_words() {
-        let base: Vec<Word> = vec![];
-        let cond = words(&[("hello", 0.9), ("world", 0.9)]);
-        let merged = merge_word_hypotheses(&base, &cond);
-        let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
-        assert_eq!(text, vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn test_merge_word_hypotheses_empty_conditioned_keeps_all_base_words() {
-        // Degenerate case of "conditioning dropped everything": must still recover `base`.
-        let base = words(&[("hello", 0.9), ("world", 0.9)]);
-        let cond: Vec<Word> = vec![];
-        let merged = merge_word_hypotheses(&base, &cond);
-        let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
-        assert_eq!(text, vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn test_join_words_skips_space_before_punctuation() {
-        let ws = words(&[("Hello", 0.9), (",", 0.9), ("world", 0.9), ("!", 0.9)]);
-        assert_eq!(join_words(&ws), "Hello, world!");
-    }
-
-    #[test]
-    fn test_join_words_skips_space_before_split_contraction_piece() {
-        // "didn't" tokenized as two words, "didn" + "'t", must not get a space in between.
-        let ws = words(&[("she", 0.9), ("didn", 0.9), ("'t", 0.9), ("know", 0.9)]);
-        assert_eq!(join_words(&ws), "she didn't know");
-    }
-
-    #[test]
-    fn test_join_words_skips_space_before_hyphen_continuation() {
-        let ws = words(&[("M", 0.9), ("-R", 0.9), ("-C", 0.9), ("-S", 0.9)]);
-        assert_eq!(join_words(&ws), "M-R-C-S");
     }
 
     #[test]

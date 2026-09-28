@@ -1,10 +1,4 @@
 // whisper_hotwords.rs
-//
-// Copyright (c) 2023-2024 Junpei Kawamoto
-//
-// This software is released under the MIT License.
-//
-// http://opensource.org/licenses/mit-license.php
 
 //! Compare Whisper transcription with and without `initial_prompt`/`hotwords` conditioning.
 //!
