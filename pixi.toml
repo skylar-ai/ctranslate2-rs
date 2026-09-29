@@ -54,6 +54,7 @@ sccache = ">=0.17.0,<0.18" # TODO we must configurate sccache ASAP!
 CFLAGS = "$CFLAGS -pthread"
 CXXFLAGS = "$CXXFLAGS -pthread"
 CUDA_ARCH_LIST = "Auto"
+CMAKE_GENERATOR = "Ninja"
 CUDA_TOOLKIT_ROOT_DIR = "$CONDA_PREFIX/targets/x86_64-linux"
 CUDA_PATH = "$CONDA_PREFIX/targets/x86_64-linux"
 
