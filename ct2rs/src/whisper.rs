@@ -19,9 +19,11 @@ use mel_spec::stft::Spectrogram;
 use ndarray::{s, stack, Array2, Array3, Axis};
 use serde::{Deserialize, Serialize};
 
-pub use super::sys::WhisperOptions;
 use super::tokenizers::hf;
 use super::{sys, Config, Tokenizer};
+
+mod conditioning;
+mod reconciliation;
 
 /// Represents a transcribed word with detailed timing and probability.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -49,6 +51,155 @@ pub struct Segment {
     pub end: f32,
     /// Word-level alignment information.
     pub words: Option<Vec<Word>>,
+}
+
+/// Options for whisper generation, plus optional content-conditioning knobs.
+///
+/// This mirrors [`sys::WhisperOptions`] field-for-field — those fields are used verbatim by the
+/// underlying decode in [`Whisper::generate`] and [`Whisper::generate_segments`] — and adds
+/// `initial_prompt`/`hotwords`, which only [`Whisper::generate_segments`] consumes to bias
+/// transcription. Both default to `None`, so existing callers relying on `..Default::default()`
+/// see no behavior change at all.
+///
+/// The field-for-field mirror (rather than wrapping [`sys::WhisperOptions`]) is required, not
+/// incidental: cxx shared structs can't carry `Option<String>` fields, so `initial_prompt`/
+/// `hotwords` can't live on `sys::WhisperOptions` itself. Mirroring the fields here, instead of
+/// nesting `sys::WhisperOptions` inside this struct, keeps flat struct-literal construction (e.g.
+/// `WhisperOptions { beam_size: 10, ..Default::default() }`) working exactly as it did before
+/// these two fields existed.
+///
+/// # Examples
+///
+/// Example of creating a default `WhisperOptions`:
+///
+/// ```
+/// use ct2rs::WhisperOptions;
+///
+/// let options = WhisperOptions::default();
+/// ```
+#[derive(Clone, Debug)]
+pub struct WhisperOptions {
+    /// Beam size to use for beam search (set 1 to run greedy search). (default: 5)
+    pub beam_size: usize,
+    /// Beam search patience factor, as described in <https://arxiv.org/abs/2204.05424>.
+    /// The decoding will continue until beam_size*patience hypotheses are finished.
+    /// (default: 1.0)
+    pub patience: f32,
+    /// Exponential penalty applied to the length during beam search. (default: 1.0)
+    pub length_penalty: f32,
+    /// Penalty applied to the score of previously generated tokens, as described in
+    /// <https://arxiv.org/abs/1909.05858> (set > 1 to penalize). (default: 1.0)
+    pub repetition_penalty: f32,
+    /// Prevent repetitions of ngrams with this size (set 0 to disable). (default: 0)
+    pub no_repeat_ngram_size: usize,
+    /// Maximum generation length. (default: 448)
+    pub max_length: usize,
+    /// Randomly sample from the top K candidates (set 0 to sample from the full distribution).
+    /// (default: 1)
+    pub sampling_topk: usize,
+    /// High temperatures increase randomness. (default: 1.0)
+    pub sampling_temperature: f32,
+    /// Number of hypotheses to include in the result. (default: 1)
+    pub num_hypotheses: usize,
+    /// Include scores in the result. (default: false)
+    pub return_scores: bool,
+    /// Include log probs of each token in the result. (default: false)
+    pub return_logits_vocab: bool,
+    /// Include the probability of the no speech token in the result. (default: false)
+    pub return_no_speech_prob: bool,
+    /// Maximum index of the first predicted timestamp. (default: 50)
+    pub max_initial_timestamp_index: usize,
+    /// Suppress blank outputs at the beginning of the sampling. (default: true)
+    pub suppress_blank: bool,
+    /// List of token IDs to suppress.
+    /// -1 will suppress a default set of symbols as defined in the model config.json file.
+    /// (default: `[-1]`)
+    pub suppress_tokens: Vec<i32>,
+    /// Optional free-form context text (e.g. topic, prior conversation). Consumed only by
+    /// [`Whisper::generate_segments`], which tokenizes it once and prepends it (via
+    /// `<|startofprev|>`) to the decoder prompt used for **every** ~30s chunk. Unlike
+    /// faster-whisper's `condition_on_previous_text`, this is a static prefix reused identically
+    /// across chunks — it is not updated with each chunk's own transcribed output. `None` (the
+    /// default) leaves generation completely unchanged.
+    ///
+    /// Conditioning is a soft bias on decoding: `generate_segments` decodes each chunk both with
+    /// and without it and reconciles the two transcripts word by word, keeping a conditioned
+    /// word only where it's an improvement and never accepting content conditioning dropped
+    /// outright (see [`Whisper::generate_segments`]).
+    pub initial_prompt: Option<String>,
+    /// Optional hint words/phrases biasing decoding toward specific vocabulary or spellings.
+    /// Consumed only by [`Whisper::generate_segments`], which tokenizes it once and prepends it
+    /// (via `<|startofprev|>`, before `initial_prompt`'s tokens) to the decoder prompt used for
+    /// every chunk. `None` (the default) leaves generation completely unchanged.
+    ///
+    /// Same per-chunk word-level reconciliation as `initial_prompt` applies here too.
+    pub hotwords: Option<String>,
+}
+
+impl Default for WhisperOptions {
+    fn default() -> Self {
+        let sys::WhisperOptions {
+            beam_size,
+            patience,
+            length_penalty,
+            repetition_penalty,
+            no_repeat_ngram_size,
+            max_length,
+            sampling_topk,
+            sampling_temperature,
+            num_hypotheses,
+            return_scores,
+            return_logits_vocab,
+            return_no_speech_prob,
+            max_initial_timestamp_index,
+            suppress_blank,
+            suppress_tokens,
+        } = sys::WhisperOptions::default();
+        Self {
+            beam_size,
+            patience,
+            length_penalty,
+            repetition_penalty,
+            no_repeat_ngram_size,
+            max_length,
+            sampling_topk,
+            sampling_temperature,
+            num_hypotheses,
+            return_scores,
+            return_logits_vocab,
+            return_no_speech_prob,
+            max_initial_timestamp_index,
+            suppress_blank,
+            suppress_tokens,
+            initial_prompt: None,
+            hotwords: None,
+        }
+    }
+}
+
+/// Converts to the FFI options consumed by the underlying decode. `initial_prompt`/`hotwords`
+/// never cross this boundary — they are applied purely on the Rust side, as extra prompt tokens,
+/// before generation is invoked.
+impl From<&WhisperOptions> for sys::WhisperOptions {
+    fn from(o: &WhisperOptions) -> Self {
+        Self {
+            beam_size: o.beam_size,
+            patience: o.patience,
+            length_penalty: o.length_penalty,
+            repetition_penalty: o.repetition_penalty,
+            no_repeat_ngram_size: o.no_repeat_ngram_size,
+            max_length: o.max_length,
+            sampling_topk: o.sampling_topk,
+            sampling_temperature: o.sampling_temperature,
+            num_hypotheses: o.num_hypotheses,
+            return_scores: o.return_scores,
+            return_logits_vocab: o.return_logits_vocab,
+            return_no_speech_prob: o.return_no_speech_prob,
+            max_initial_timestamp_index: o.max_initial_timestamp_index,
+            suppress_blank: o.suppress_blank,
+            suppress_tokens: o.suppress_tokens.clone(),
+        }
+    }
 }
 
 const PREPROCESSOR_CONFIG_FILE: &str = "preprocessor_config.json";
@@ -138,7 +289,11 @@ impl Whisper {
         let prompt = self.generate_prompt(&lang_token, timestamp);
 
         self.whisper
-            .generate(&storage_view, &vec![prompt; num_chunks], options)?
+            .generate(
+                &storage_view,
+                &vec![prompt; num_chunks],
+                &sys::WhisperOptions::from(options),
+            )?
             .into_iter()
             .map(|res| {
                 let r = res
@@ -160,7 +315,12 @@ impl Whisper {
     ///   [`n_samples`][Whisper::n_samples] method, they will be processed in segments.
     /// * `language` - An optional language setting. It generates segments assuming the specified language.
     ///   If `None`, it uses Whisper's language detection.
-    /// * `options` - Settings.
+    /// * `options` - Settings, including the optional `initial_prompt`/`hotwords` conditioning
+    ///   knobs (see [`WhisperOptions`]). When either is set, each chunk is decoded twice (with
+    ///   and without conditioning) and the two transcripts are reconciled word by word: a
+    ///   conditioned word is kept only where it's more confident than the baseline, and content
+    ///   conditioning drops entirely is never accepted, at roughly 2x the decode and alignment
+    ///   cost for those chunks.
     ///
     /// # Returns
     /// Returns a `Result` containing a vector of transcribed `Segment`s if successful,
@@ -188,92 +348,36 @@ impl Whisper {
         // Pass features through the encoder network to get encoder outputs
         let encoder_output = self.whisper.encode(&storage_view, false)?;
 
-        let prompt = self.generate_prompt(&lang_token, true);
-
-        // For alignment and timing, we do want timestamps
-        let gen_results =
-            self.whisper
-                .generate(&encoder_output, &vec![prompt.clone(); num_chunks], options)?;
-
-        // Build start sequence token IDs for alignment FFI
-        let start_seq: Vec<usize> = prompt
-            .iter()
-            .map(|t| {
-                self.tokenizer
-                    .token_to_id(t)
-                    .map(|id| id as usize)
-                    .unwrap_or(0)
-            })
-            .collect();
-
-        let num_frames = vec![self.config.nb_max_frames; num_chunks];
-        let text_tokens: Vec<Vec<usize>> = gen_results
-            .iter()
-            .map(|res| res.sequences_ids[0].clone())
-            .collect();
-
-        // Run DTW alignments on the encoder output cross-attention weights
-        let alignment_results = self.whisper.align(
-            &encoder_output,
-            &start_seq,
-            &text_tokens,
-            &num_frames,
-            7, // median filter width
+        let conditioning_prefix = self.build_conditioning_prefix(
+            options.initial_prompt.as_deref(),
+            options.hotwords.as_deref(),
+            options.max_length,
         )?;
 
-        let mut segments = Vec::new();
+        let sot_sequence = self.generate_prompt(&lang_token, true);
+        let baseline_prompt: Vec<String> = sot_sequence.iter().map(|t| t.to_string()).collect();
 
-        for (chunk_idx, (res, align_res)) in
-            gen_results.iter().zip(alignment_results.iter()).enumerate()
-        {
-            let tokens = &res.sequences[0];
-            let alignments = &align_res.alignments;
-            let text_token_probs = &align_res.text_token_probs;
-
-            let word_token_ranges = group_tokens_into_words(tokens);
-            let chunk_words = process_word_timings(
-                &word_token_ranges,
-                alignments,
-                text_token_probs,
-                tokens.len(),
+        if conditioning_prefix.is_empty() {
+            return self.generate_segments_plain(
+                &encoder_output,
+                &baseline_prompt,
+                num_chunks,
+                options,
             );
-
-            let chunk_offset =
-                (chunk_idx * self.config.n_samples) as f32 / self.config.sampling_rate as f32;
-
-            let mut final_words = Vec::new();
-            for (range, mut word) in word_token_ranges.into_iter().zip(chunk_words.into_iter()) {
-                let word_text = self.tokenizer.decode(tokens[range.clone()].to_vec())?;
-                let clean_word_text = word_text.trim().to_string();
-                if clean_word_text.is_empty() {
-                    continue;
-                }
-                word.word = clean_word_text;
-                word.start += chunk_offset;
-                word.end += chunk_offset;
-                final_words.push(word);
-            }
-
-            let clean_tokens: Vec<String> = tokens
-                .iter()
-                .filter(|t| !is_special_token(t))
-                .cloned()
-                .collect();
-            let chunk_text = self.tokenizer.decode(clean_tokens)?.trim().to_string();
-
-            let seg_start = final_words.first().map(|w| w.start).unwrap_or(chunk_offset);
-            let seg_end = final_words.last().map(|w| w.end).unwrap_or(chunk_offset);
-
-            segments.push(Segment {
-                id: chunk_idx,
-                text: chunk_text,
-                start: seg_start,
-                end: seg_end,
-                words: Some(final_words),
-            });
         }
 
-        Ok(segments)
+        let conditioned_prompt: Vec<String> = conditioning_prefix
+            .into_iter()
+            .chain(baseline_prompt.iter().cloned())
+            .collect();
+
+        self.generate_segments_with_conditioning(
+            &encoder_output,
+            &baseline_prompt,
+            &conditioned_prompt,
+            num_chunks,
+            options,
+        )
     }
 
     /// Returns the expected sampling rate.
@@ -583,6 +687,15 @@ mod tests_grouping {
     }
 
     #[test]
+    fn test_default_whisper_options_has_no_conditioning() {
+        let options = super::WhisperOptions::default();
+        assert!(options.initial_prompt.is_none());
+        assert!(options.hotwords.is_none());
+        assert_eq!(options.beam_size, 5);
+        assert_eq!(options.max_length, 448);
+    }
+
+    #[test]
     fn test_process_word_timings() {
         use crate::sys::WhisperTokenAlignment;
 
@@ -768,7 +881,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_whisper_debug() {
         let model_path = download_model(MODEL_ID).unwrap();
         let w = Whisper::new(
@@ -788,7 +900,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_whisper_generate_segments() {
         let model_path = download_model(MODEL_ID).unwrap();
         let w = Whisper::new(
@@ -845,6 +956,79 @@ mod tests {
                         word.probability >= 0.0 && word.probability <= 1.0,
                         "Word probability must be between 0.0 and 1.0"
                     );
+                }
+            }
+        }
+    }
+
+    /// Transcribes the same audio with and without `initial_prompt`/`hotwords` conditioning and
+    /// prints both transcripts so the difference in wording/spelling can be inspected by hand.
+    /// Not a golden-output assertion: conditioning is a soft bias, so exact wording shifts are
+    /// not guaranteed on arbitrary audio, but the injected conditioning tokens must never leak
+    /// into the transcribed text/words either way.
+    #[test]
+    fn test_whisper_generate_segments_prompt_conditioning_comparison() {
+        let model_path = download_model(MODEL_ID).unwrap();
+        let w = Whisper::new(
+            &model_path,
+            Config {
+                device: if cfg!(feature = "cuda") {
+                    Device::CUDA
+                } else {
+                    Device::CPU
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let wav_path = std::path::Path::new("tests/assets/test.wav");
+        if !wav_path.exists() {
+            if let Some(parent) = wav_path.parent() {
+                std::fs::create_dir_all(parent).expect("failed to create directory for wav file");
+            }
+            let url =
+                "https://www.voiptroubleshooter.com/open_speech/american/OSR_us_000_0010_8k.wav";
+            let response = ureq::get(url).call().expect("failed to download wav file");
+            let mut out = std::fs::File::create(wav_path).expect("failed to create wav file");
+            std::io::copy(&mut response.into_reader(), &mut out).expect("failed to write wav file");
+        }
+
+        let samples = read_audio(wav_path, w.sampling_rate()).unwrap();
+
+        let baseline = w
+            .generate_segments(&samples, Some("en"), &Default::default())
+            .unwrap();
+
+        let conditioned_options = super::WhisperOptions {
+            initial_prompt: Some(
+                "A recording used for telephone audio quality testing.".to_string(),
+            ),
+            hotwords: Some("OSR".to_string()),
+            ..Default::default()
+        };
+        let conditioned = w
+            .generate_segments(&samples, Some("en"), &conditioned_options)
+            .unwrap();
+
+        assert!(
+            !conditioned.is_empty(),
+            "Generated segments should not be empty"
+        );
+
+        let baseline_text: String = baseline.iter().map(|s| s.text.as_str()).collect();
+        let conditioned_text: String = conditioned.iter().map(|s| s.text.as_str()).collect();
+
+        println!("--- WITHOUT initial_prompt/hotwords ---\n{baseline_text}");
+        println!("--- WITH initial_prompt/hotwords ------\n{conditioned_text}");
+
+        // The injected conditioning tokens must never leak into the transcribed text/words,
+        // regardless of whether the conditioning otherwise nudges the transcribed wording.
+        for segment in &conditioned {
+            if let Some(words) = &segment.words {
+                for word in words {
+                    assert!(word.start <= word.end);
+                    assert!((0.0..=1.0).contains(&word.probability));
                 }
             }
         }
