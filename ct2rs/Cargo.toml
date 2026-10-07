@@ -144,5 +144,9 @@ name = "stream"
 name = "whisper"
 required-features = ["whisper"]
 
+[[example]]
+name = "whisper_hotwords"
+required-features = ["whisper"]
+
 [package.metadata.docs.rs]
 features = ["whisper", "hub"]

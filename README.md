@@ -126,6 +126,15 @@ This crate also offers a streaming API that utilizes callback closures.
 Please refer to the [example code](ct2rs/examples/stream.rs)
 for more information.
 
+## Whisper Prompt Conditioning
+
+`Whisper::generate_segments_conditioned` accepts a `WhisperConditioning` with an optional
+`initial_prompt` and `hotwords` to bias transcription toward known vocabulary, such as proper nouns or domain-specific
+terms the model would otherwise misspell.
+Please refer to the [example code](ct2rs/examples/whisper_hotwords.rs)
+for more information, or [ADR-001](ct2rs/docs/adr/001-word-level-reconciliation-for-whisper-conditioning.md)
+for the design rationale.
+
 ## Model Conversion for CTranslate2
 
 To use model files with CTranslate2, they must first be converted.

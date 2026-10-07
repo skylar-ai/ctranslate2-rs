@@ -51,6 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       LIBRARY_PATH: /usr/lib/x86_64-linux-gnu
+      # Build OpenBLAS with runtime CPU dispatch so a cached build stays usable on runners with different CPUs.
+      OPENBLAS_DYNAMIC_ARCH: "1"
 
     steps:
       - uses: actions/checkout@v7
