@@ -30,7 +30,7 @@ test = "cargo test -p ct2rs"
 [tasks.cuda-dyn]
 cmd = 'cargo build -p ct2rs --no-default-features -F "cuda,cuda-dynamic-loading,all-tokenizers,hub,ruy"'
 default-environment = "platform-cuda-dyn"
-env = { CARGO_TARGET_DIR = "target/cuda-dyn" }
+env = { CARGO_TARGET_DIR = "$PIXI_PROJECT_ROOT/target/cuda-dyn" }
 
 [tasks.cuda-full]
 cmd = 'cargo build -p ct2rs --no-default-features -F "cuda,all-tokenizers,hub,ruy"'
@@ -40,17 +40,17 @@ env = { CARGO_TARGET_DIR = "target/cuda-full" }
 [tasks.whisper-dyn]
 cmd = 'cargo build -p ct2rs --no-default-features -F "cuda,cuda-dynamic-loading,all-tokenizers,whisper,hub,ruy"'
 default-environment = "platform-cuda-dyn"
-env = { CARGO_TARGET_DIR = "target/whisper-dyn" }
+env = { CARGO_TARGET_DIR = "$PIXI_PROJECT_ROOT/target/cuda-dyn" }
 
 [tasks.check-whisper-dyn]
 cmd = 'cargo check -p ct2rs --no-default-features -F "cuda,cuda-dynamic-loading,all-tokenizers,whisper,hub,ruy"'
 default-environment = "platform-cuda-dyn"
-env = { CARGO_TARGET_DIR = "target/whisper-dyn" }
+env = { CARGO_TARGET_DIR = "$PIXI_PROJECT_ROOT/target/cuda-dyn" }
 
 [tasks.flash-attn]
 cmd = 'cargo build -p ct2rs --no-default-features -F "cuda,cuda-dynamic-loading,flash-attention,all-tokenizers,hub,ruy"'
 default-environment = "platform-cuda-dyn"
-env = { CUDA_ARCH_LIST = "8.9;9.0;10.0;12.0", CARGO_TARGET_DIR = "target/cuda-dyn" }
+env = { CUDA_ARCH_LIST = "8.9;9.0;10.0;12.0", CARGO_TARGET_DIR = "$PIXI_PROJECT_ROOT/target/flash-attn" }
 
 [tasks.doc]
 cmd = "cargo rustdoc -F whisper,hub -p ct2rs -- --cfg docsrs"
@@ -79,8 +79,9 @@ ninja = ">=1.13.2,<2"
 sccache = ">=0.17.0,<0.18" # TODO we must configurate sccache ASAP!
 
 [activation.env]
-CFLAGS = "$CFLAGS -pthread"
-CXXFLAGS = "$CXXFLAGS -pthread"
+# TODO probably we dont need these `-pthread` flags.
+# CFLAGS = "$CFLAGS -pthread"
+# CXXFLAGS = "$CXXFLAGS -pthread"
 CMAKE_GENERATOR = "Ninja"
 
 [environments]
