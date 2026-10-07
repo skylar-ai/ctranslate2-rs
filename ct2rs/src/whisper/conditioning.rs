@@ -1,8 +1,9 @@
 //! `initial_prompt`/`hotwords` conditioning for [`super::Whisper::generate_segments_conditioned`].
 //!
 //! Builds the `<|startofprev|>`-prefixed prompt tokens for `initial_prompt`/`hotwords`, mirroring
-//! faster-whisper's `get_prompt` token order and length-capping semantics but applied identically
-//! to every chunk (no rolling previous-text conditioning). When conditioning is requested, each
+//! faster-whisper's `get_prompt` token order but applied identically to every chunk (no rolling
+//! previous-text conditioning), and capped so the conditioned decode keeps the same output budget
+//! as the plain one (see [`conditioning_token_budget`]). When conditioning is requested, each
 //! chunk is decoded twice — once with the plain prompt, once with the conditioned one — and the
 //! two transcripts are reconciled word by word via
 //! [`reconciliation::merge_word_hypotheses`][super::reconciliation::merge_word_hypotheses], so
@@ -187,15 +188,16 @@ impl Whisper {
     }
 
     /// Builds the `<|startofprev|>`-prefixed conditioning tokens for `hotwords`/`initial_prompt`,
-    /// mirroring faster-whisper's `get_prompt` token order and length-capping semantics, but
-    /// applied identically to every chunk (no rolling previous-text conditioning). Blank
-    /// (empty/whitespace-only) text counts as not provided. Returns an empty vector if neither is
-    /// provided, in which case callers see no behavior change at all.
+    /// mirroring faster-whisper's `get_prompt` token order, but applied identically to every chunk
+    /// (no rolling previous-text conditioning). At most `budget` content tokens are kept in total
+    /// (see [`conditioning_token_budget`] and [`fit_to_budget`]). Blank (empty/whitespace-only)
+    /// text counts as not provided. Returns an empty vector if neither is provided, in which case
+    /// callers see no behavior change at all.
     pub(super) fn build_conditioning_prefix(
         &self,
         initial_prompt: Option<&str>,
         hotwords: Option<&str>,
-        max_length: usize,
+        budget: usize,
     ) -> Result<Vec<String>> {
         let initial_prompt = non_blank(initial_prompt);
         let hotwords = non_blank(hotwords);
@@ -203,15 +205,19 @@ impl Whisper {
             return Ok(Vec::new());
         }
 
+        let hotwords_tokens = hotwords.map(|hw| self.encode_raw(hw)).transpose()?;
+        let prompt_tokens = initial_prompt
+            .map(|prompt| self.encode_raw(prompt))
+            .transpose()?;
+        let (hotwords_tokens, prompt_tokens) = fit_to_budget(
+            hotwords_tokens.unwrap_or_default(),
+            prompt_tokens.unwrap_or_default(),
+            budget,
+        );
+
         let mut prefix = vec!["<|startofprev|>".to_string()];
-
-        if let Some(hw) = hotwords {
-            prefix.extend(cap_head(self.encode_raw(hw)?, max_length));
-        }
-        if let Some(prompt) = initial_prompt {
-            prefix.extend(cap_tail(self.encode_raw(prompt)?, max_length));
-        }
-
+        prefix.extend(hotwords_tokens);
+        prefix.extend(prompt_tokens);
         Ok(prefix)
     }
 
@@ -263,25 +269,40 @@ fn non_blank(text: Option<&str>) -> Option<&str> {
     text.filter(|t| !t.trim().is_empty())
 }
 
-/// Hotwords are head-truncated when too long: keep only the first `max_length/2 - 1` tokens,
-/// matching faster-whisper's `hotwords_tokens[: max_length // 2 - 1]`.
-fn cap_head(mut tokens: Vec<String>, max_length: usize) -> Vec<String> {
-    let threshold = max_length / 2;
-    if tokens.len() >= threshold {
-        tokens.truncate(threshold.saturating_sub(1));
-    }
-    tokens
+/// Maximum number of `hotwords` + `initial_prompt` content tokens for a decode whose
+/// start-of-transcript sequence is `sot_len` tokens long.
+///
+/// CTranslate2 lets a Whisper decode generate `min(max_length / 2, max_length - prompt_len)` new
+/// tokens, and alignment then re-feeds `prompt + <|notimestamps|> + text + <|eot|>` through the
+/// decoder, which only has `max_length` positions. Keeping the whole conditioned prompt
+/// (`<|startofprev|>` + content + sot sequence) at most `max_length / 2 - 2` tokens therefore
+/// leaves the conditioned decode the same `max_length / 2` output budget as the plain one, and
+/// guarantees its alignment fits too.
+pub(super) fn conditioning_token_budget(max_length: usize, sot_len: usize) -> usize {
+    (max_length / 2).saturating_sub(sot_len + 3)
 }
 
-/// `initial_prompt` tokens are tail-kept when too long: keep only the last `max_length/2 - 1`
-/// tokens, matching faster-whisper's `previous_tokens[-(max_length // 2 - 1):]`.
-fn cap_tail(tokens: Vec<String>, max_length: usize) -> Vec<String> {
-    let keep = (max_length / 2).saturating_sub(1);
-    if tokens.len() > keep {
-        tokens[tokens.len() - keep..].to_vec()
-    } else {
-        tokens
+/// Fits `hotwords` and `initial_prompt` tokens into `budget` tokens in total. When both don't fit,
+/// each is guaranteed at least half of the budget, and either may use whatever the other leaves
+/// unused. Hotwords keep their head (as in faster-whisper's `hotwords_tokens[:n]`) and the initial
+/// prompt keeps its tail (as in faster-whisper's `previous_tokens[-n:]`), the end closest to the
+/// audio being transcribed.
+fn fit_to_budget(
+    mut hotwords: Vec<String>,
+    prompt: Vec<String>,
+    budget: usize,
+) -> (Vec<String>, Vec<String>) {
+    if hotwords.len() + prompt.len() <= budget {
+        return (hotwords, prompt);
     }
+    let hotwords_keep = hotwords
+        .len()
+        .min((budget / 2).max(budget.saturating_sub(prompt.len())));
+    let prompt_keep = prompt.len().min(budget - hotwords_keep);
+
+    hotwords.truncate(hotwords_keep);
+    let prompt = prompt[prompt.len() - prompt_keep..].to_vec();
+    (hotwords, prompt)
 }
 
 #[cfg(test)]
@@ -296,31 +317,52 @@ mod tests {
         assert_eq!(non_blank(Some(" Kubernetes ")), Some(" Kubernetes "));
     }
 
-    #[test]
-    fn test_cap_head_truncates_hotwords_tokens() {
-        let tokens: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
-        let capped = cap_head(tokens, 20); // threshold = 10, keep = 9
-        assert_eq!(capped.len(), 9);
-        assert_eq!(capped[0], "t0");
+    fn tokens(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i}")).collect()
     }
 
     #[test]
-    fn test_cap_head_leaves_short_hotwords_untouched() {
-        let tokens: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
-        assert_eq!(cap_head(tokens.clone(), 20), tokens);
+    fn test_conditioning_token_budget_leaves_room_for_output_and_alignment() {
+        // 448 / 2 = 224 positions for the prompt, minus the 3-token sot sequence,
+        // `<|startofprev|>`, and the `<|notimestamps|>`/`<|eot|>` alignment adds.
+        assert_eq!(conditioning_token_budget(448, 3), 218);
+        assert_eq!(conditioning_token_budget(4, 3), 0);
     }
 
     #[test]
-    fn test_cap_tail_keeps_last_tokens_of_initial_prompt() {
-        let tokens: Vec<String> = (0..20).map(|i| format!("t{i}")).collect();
-        let capped = cap_tail(tokens, 20); // keep = 9
-        assert_eq!(capped.len(), 9);
-        assert_eq!(capped[0], "t11");
+    fn test_fit_to_budget_leaves_short_inputs_untouched() {
+        let (hw, prompt) = fit_to_budget(tokens("h", 5), tokens("p", 5), 10);
+        assert_eq!(hw, tokens("h", 5));
+        assert_eq!(prompt, tokens("p", 5));
     }
 
     #[test]
-    fn test_cap_tail_leaves_short_prompt_untouched() {
-        let tokens: Vec<String> = (0..5).map(|i| format!("t{i}")).collect();
-        assert_eq!(cap_tail(tokens.clone(), 20), tokens);
+    fn test_fit_to_budget_splits_evenly_when_both_are_long() {
+        let (hw, prompt) = fit_to_budget(tokens("h", 20), tokens("p", 20), 10);
+        assert_eq!(hw, tokens("h", 5), "hotwords keep their head");
+        assert_eq!(
+            prompt,
+            tokens("p", 20)[15..],
+            "initial prompt keeps its tail"
+        );
+    }
+
+    #[test]
+    fn test_fit_to_budget_gives_unused_share_to_the_other_input() {
+        let (hw, prompt) = fit_to_budget(tokens("h", 20), tokens("p", 2), 10);
+        assert_eq!((hw.len(), prompt.len()), (8, 2));
+
+        let (hw, prompt) = fit_to_budget(tokens("h", 2), tokens("p", 20), 10);
+        assert_eq!((hw.len(), prompt.len()), (2, 8));
+        assert_eq!(prompt, tokens("p", 20)[12..]);
+    }
+
+    #[test]
+    fn test_fit_to_budget_with_single_input() {
+        let (hw, prompt) = fit_to_budget(tokens("h", 20), Vec::new(), 10);
+        assert_eq!((hw, prompt.len()), (tokens("h", 10), 0));
+
+        let (hw, prompt) = fit_to_budget(Vec::new(), tokens("p", 20), 10);
+        assert_eq!((hw.len(), prompt), (0, tokens("p", 20)[10..].to_vec()));
     }
 }

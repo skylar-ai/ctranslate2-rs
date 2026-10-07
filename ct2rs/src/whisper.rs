@@ -63,6 +63,12 @@ pub use super::sys::WhisperOptions;
 /// `None` makes [`Whisper::generate_segments_conditioned`] behave exactly like
 /// [`Whisper::generate_segments`].
 ///
+/// Together, `hotwords` and `initial_prompt` may use at most about half of the decoder's
+/// `max_length` context (218 tokens with the default `max_length` of 448), so the conditioned
+/// decode keeps the same output budget as the plain one. Longer text is truncated rather than
+/// rejected: hotwords keep their beginning and the initial prompt its end, each keeping at least
+/// half of that budget when both are long.
+///
 /// # Examples
 ///
 /// ```
@@ -259,14 +265,14 @@ impl Whisper {
         // Pass features through the encoder network to get encoder outputs
         let encoder_output = self.whisper.encode(&storage_view, false)?;
 
+        let sot_sequence = self.generate_prompt(&lang_token, true);
+        let baseline_prompt: Vec<String> = sot_sequence.iter().map(|t| t.to_string()).collect();
+
         let conditioning_prefix = self.build_conditioning_prefix(
             conditioning.initial_prompt,
             conditioning.hotwords,
-            options.max_length,
+            conditioning::conditioning_token_budget(options.max_length, baseline_prompt.len()),
         )?;
-
-        let sot_sequence = self.generate_prompt(&lang_token, true);
-        let baseline_prompt: Vec<String> = sot_sequence.iter().map(|t| t.to_string()).collect();
 
         if conditioning_prefix.is_empty() {
             return self.generate_segments_plain(
@@ -997,13 +1003,13 @@ mod tests {
         let w = load_test_model();
 
         let prefix = w
-            .build_conditioning_prefix(Some("telephone audio"), Some("OSR"), 448)
+            .build_conditioning_prefix(Some("telephone audio"), Some("OSR"), 218)
             .unwrap();
         assert_eq!(prefix[0], "<|startofprev|>");
         let decoded = w.tokenizer.decode(prefix[1..].to_vec()).unwrap();
         assert_eq!(decoded.trim(), "OSR telephone audio");
 
-        let only_hotwords = w.build_conditioning_prefix(None, Some("OSR"), 448).unwrap();
+        let only_hotwords = w.build_conditioning_prefix(None, Some("OSR"), 218).unwrap();
         assert_eq!(only_hotwords[0], "<|startofprev|>");
         assert_eq!(
             w.tokenizer
@@ -1014,12 +1020,47 @@ mod tests {
         );
 
         assert!(w
-            .build_conditioning_prefix(None, None, 448)
+            .build_conditioning_prefix(None, None, 218)
             .unwrap()
             .is_empty());
         assert!(w
-            .build_conditioning_prefix(Some("  "), Some(""), 448)
+            .build_conditioning_prefix(Some("  "), Some(""), 218)
             .unwrap()
             .is_empty());
+    }
+
+    /// Conditioning far longer than the decoder context must be truncated to fit, not fail with a
+    /// position-encoding error in `generate` or `align`. Silence makes the decode run to its
+    /// length limit, which is when an oversized prefix overflows the 448 positions.
+    #[test]
+    fn test_whisper_oversized_conditioning_fits_decoder_context() {
+        let w = load_test_model();
+        let options = super::WhisperOptions::default();
+        let long_prompt = "A recording used for telephone audio quality testing. ".repeat(200);
+        let long_hotwords = "OSR, telephone, harvard sentences, ".repeat(200);
+
+        for (initial_prompt, hotwords) in [
+            (Some(long_prompt.as_str()), None),
+            (None, Some(long_hotwords.as_str())),
+            (Some(long_prompt.as_str()), Some(long_hotwords.as_str())),
+        ] {
+            let prefix = w
+                .build_conditioning_prefix(
+                    initial_prompt,
+                    hotwords,
+                    super::conditioning::conditioning_token_budget(options.max_length, 3),
+                )
+                .unwrap();
+            assert!(prefix.len() + 3 <= options.max_length / 2 - 2);
+
+            let conditioning = super::WhisperConditioning {
+                initial_prompt,
+                hotwords,
+            };
+            for samples in [vec![0.0f32; w.n_samples()], load_test_audio(&w)] {
+                w.generate_segments_conditioned(&samples, Some("en"), &options, &conditioning)
+                    .unwrap_or_else(|e| panic!("oversized conditioning failed: {e:#}"));
+            }
+        }
     }
 }
