@@ -973,6 +973,11 @@ mod tests {
 
     /// Unset (or blank) conditioning must be a true no-op: byte-for-byte the same segments, word
     /// timings and probabilities as plain `generate_segments`.
+    ///
+    /// That comparison is only meaningful on a backend that reproduces its own output for
+    /// identical calls. Some don't (e.g. multithreaded OpenBLAS on Windows), so the check is
+    /// skipped there; `test_whisper_conditioning_prefix_contains_hotwords_then_initial_prompt`
+    /// still covers blank conditioning producing no prefix.
     #[test]
     fn test_whisper_unset_conditioning_is_identical_to_plain() {
         let w = load_test_model();
@@ -981,6 +986,10 @@ mod tests {
 
         let plain = w.generate_segments(&samples, Some("en"), &options).unwrap();
         assert!(!plain.is_empty());
+        if w.generate_segments(&samples, Some("en"), &options).unwrap() != plain {
+            eprintln!("skipping: this backend's output differs between identical calls");
+            return;
+        }
 
         for conditioning in [
             super::WhisperConditioning::default(),
