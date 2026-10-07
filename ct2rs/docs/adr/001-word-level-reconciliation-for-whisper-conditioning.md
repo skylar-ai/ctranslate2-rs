@@ -7,7 +7,7 @@
 
 ## Context and Problem Statement
 
-`WhisperOptions::initial_prompt`/`hotwords` bias `Whisper::generate_segments` toward known
+`WhisperConditioning::initial_prompt`/`hotwords` bias `Whisper::generate_segments_conditioned` toward known
 vocabulary (proper nouns, domain terms) by prepending a static `<|startofprev|>` token prefix to
 the decoder prompt for every chunk, mirroring faster-whisper's `get_prompt`. That prefix biases
 the whole chunk's decode trajectory, not just the target word's position: on real audio, it can

@@ -30,8 +30,8 @@ fn word_edit_script(base: &[Word], cond: &[Word]) -> Vec<WordEditOp> {
     for (i, row) in dp.iter_mut().enumerate() {
         row[0] = i as u32;
     }
-    for j in 0..=m {
-        dp[0][j] = j as u32;
+    for (j, cell) in dp[0].iter_mut().enumerate() {
+        *cell = j as u32;
     }
     for i in 1..=n {
         for j in 1..=m {

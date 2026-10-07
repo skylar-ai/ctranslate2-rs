@@ -1,4 +1,4 @@
-//! `initial_prompt`/`hotwords` conditioning for [`super::Whisper::generate_segments`].
+//! `initial_prompt`/`hotwords` conditioning for [`super::Whisper::generate_segments_conditioned`].
 //!
 //! Builds the `<|startofprev|>`-prefixed prompt tokens for `initial_prompt`/`hotwords`, mirroring
 //! faster-whisper's `get_prompt` token order and length-capping semantics but applied identically
@@ -24,11 +24,9 @@ impl Whisper {
         num_chunks: usize,
         options: &WhisperOptions,
     ) -> Result<Vec<Segment>> {
-        let gen_results = self.whisper.generate(
-            encoder_output,
-            &vec![prompt.to_vec(); num_chunks],
-            &sys::WhisperOptions::from(options),
-        )?;
+        let gen_results =
+            self.whisper
+                .generate(encoder_output, &vec![prompt.to_vec(); num_chunks], options)?;
         let alignment_results =
             self.align_chunks(encoder_output, prompt, &gen_results, num_chunks)?;
 
@@ -93,8 +91,6 @@ impl Whisper {
         num_chunks: usize,
         options: &WhisperOptions,
     ) -> Result<Vec<Segment>> {
-        let ffi_options = sys::WhisperOptions::from(options);
-
         // These must be two separate `generate()` calls, not one batch of both prompt kinds:
         // CTranslate2 requires every prompt within a single batch to have
         // `<|startoftranscript|>` at the same index, which the conditioned prompt (longer,
@@ -102,12 +98,12 @@ impl Whisper {
         let conditioned_results = self.whisper.generate(
             encoder_output,
             &vec![conditioned_prompt.to_vec(); num_chunks],
-            &ffi_options,
+            options,
         )?;
         let baseline_results = self.whisper.generate(
             encoder_output,
             &vec![baseline_prompt.to_vec(); num_chunks],
-            &ffi_options,
+            options,
         )?;
 
         // Each candidate is aligned with its own matching prompt, so word-level confidence
@@ -176,7 +172,7 @@ impl Whisper {
         );
 
         let mut final_words = Vec::new();
-        for (range, mut word) in word_token_ranges.into_iter().zip(chunk_words.into_iter()) {
+        for (range, mut word) in word_token_ranges.into_iter().zip(chunk_words) {
             let word_text = self.tokenizer.decode(tokens[range.clone()].to_vec())?;
             let clean_word_text = word_text.trim().to_string();
             if clean_word_text.is_empty() {
@@ -192,14 +188,17 @@ impl Whisper {
 
     /// Builds the `<|startofprev|>`-prefixed conditioning tokens for `hotwords`/`initial_prompt`,
     /// mirroring faster-whisper's `get_prompt` token order and length-capping semantics, but
-    /// applied identically to every chunk (no rolling previous-text conditioning). Returns an
-    /// empty vector if neither is provided, in which case callers see no behavior change at all.
+    /// applied identically to every chunk (no rolling previous-text conditioning). Blank
+    /// (empty/whitespace-only) text counts as not provided. Returns an empty vector if neither is
+    /// provided, in which case callers see no behavior change at all.
     pub(super) fn build_conditioning_prefix(
         &self,
         initial_prompt: Option<&str>,
         hotwords: Option<&str>,
         max_length: usize,
     ) -> Result<Vec<String>> {
+        let initial_prompt = non_blank(initial_prompt);
+        let hotwords = non_blank(hotwords);
         if initial_prompt.is_none() && hotwords.is_none() {
             return Ok(Vec::new());
         }
@@ -258,6 +257,12 @@ impl Whisper {
     }
 }
 
+/// Treats empty/whitespace-only text as absent, so e.g. a blank form field or an empty proto3
+/// `string` can't trigger conditioning with no actual content.
+fn non_blank(text: Option<&str>) -> Option<&str> {
+    text.filter(|t| !t.trim().is_empty())
+}
+
 /// Hotwords are head-truncated when too long: keep only the first `max_length/2 - 1` tokens,
 /// matching faster-whisper's `hotwords_tokens[: max_length // 2 - 1]`.
 fn cap_head(mut tokens: Vec<String>, max_length: usize) -> Vec<String> {
@@ -282,6 +287,14 @@ fn cap_tail(tokens: Vec<String>, max_length: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_non_blank_treats_empty_and_whitespace_as_absent() {
+        assert_eq!(non_blank(None), None);
+        assert_eq!(non_blank(Some("")), None);
+        assert_eq!(non_blank(Some(" \t\n")), None);
+        assert_eq!(non_blank(Some(" Kubernetes ")), Some(" Kubernetes "));
+    }
 
     #[test]
     fn test_cap_head_truncates_hotwords_tokens() {
