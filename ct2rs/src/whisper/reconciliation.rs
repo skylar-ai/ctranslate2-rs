@@ -3,6 +3,8 @@
 //! [`conditioning::generate_segments_with_conditioning`][super::conditioning::generate_segments_with_conditioning]
 //! so that conditioning can bias wording but never silently drop content.
 
+use std::collections::HashSet;
+
 use super::Word;
 
 /// One elementary edit-script operation aligning a `base` word sequence to a `cond` one, with
@@ -83,7 +85,8 @@ fn word_edit_script(base: &[Word], cond: &[Word]) -> Vec<WordEditOp> {
 /// rather than picking one whole transcript as the winner.
 ///
 /// Policy per aligned block between two matching anchor words (see [`word_edit_script`]):
-/// - Both sides agree: kept as-is.
+/// - Both sides agree: `cond`'s word is kept, with `base`'s timing. Each side has its own DTW
+///   alignment, and anchors must share a time base with the `base` words kept around them.
 /// - `cond` added words `base` didn't have (pure insertion): kept, since conditioning
 ///   contributing extra content it's confident about is not a risk worth guarding against.
 /// - `base` has words `cond` doesn't (pure deletion): **`base`'s words are always kept**.
@@ -100,8 +103,14 @@ pub(super) fn merge_word_hypotheses(base: &[Word], cond: &[Word]) -> Vec<Word> {
 
     let mut idx = 0;
     while idx < ops.len() {
-        if let WordEditOp::Match(_, cond_idx) = ops[idx] {
-            merged.push(cond[cond_idx].clone());
+        if let WordEditOp::Match(base_idx, cond_idx) = ops[idx] {
+            // Keep the conditioned spelling but the baseline timing, so a matched word shares
+            // its time base with the baseline-only words around it.
+            merged.push(Word {
+                start: base[base_idx].start,
+                end: base[base_idx].end,
+                ..cond[cond_idx].clone()
+            });
             idx += 1;
             continue;
         }
@@ -142,6 +151,56 @@ pub(super) fn merge_word_hypotheses(base: &[Word], cond: &[Word]) -> Vec<Word> {
     }
 
     merged
+}
+
+/// Fraction of `cond`'s words that look copied from the conditioning text rather than heard:
+/// words covered by a word trigram that appears in `conditioning` but nowhere in `base`.
+///
+/// A decoder that stops following the audio and repeats its prompt does so with very high
+/// confidence, so [`merge_word_hypotheses`] can't reject it on probability. Requiring the trigram
+/// to be absent from `base` keeps a relevant prompt from triggering this: when the speech really
+/// contains the prompt's wording, the unconditioned decode contains it too.
+pub(super) fn copied_from_prompt_ratio(base: &[Word], cond: &[Word], conditioning: &str) -> f32 {
+    let cond_words = normalized_words(cond.iter().map(|w| w.word.as_str()));
+    if cond_words.len() < 3 {
+        return 0.0;
+    }
+    let base_words = normalized_words(base.iter().map(|w| w.word.as_str()));
+    let prompt_words = normalized_words(conditioning.split_whitespace());
+    let base_trigrams = trigrams(&base_words);
+    let prompt_trigrams = trigrams(&prompt_words);
+
+    let mut copied = vec![false; cond_words.len()];
+    for (i, trigram) in cond_words.windows(3).enumerate() {
+        if prompt_trigrams.contains(trigram) && !base_trigrams.contains(trigram) {
+            copied[i..i + 3].fill(true);
+        }
+    }
+    copied.iter().filter(|&&c| c).count() as f32 / cond_words.len() as f32
+}
+
+/// Whether word start times never go backwards by more than `tolerance` seconds.
+pub(super) fn is_monotonic(words: &[Word], tolerance: f32) -> bool {
+    words
+        .windows(2)
+        .all(|pair| pair[1].start >= pair[0].start - tolerance)
+}
+
+/// Lowercases words and strips punctuation, dropping words that were only punctuation.
+fn normalized_words<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
+    words
+        .map(|w| {
+            w.chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+fn trigrams(words: &[String]) -> HashSet<&[String]> {
+    words.windows(3).collect()
 }
 
 fn extend_range(range: Option<(usize, usize)>, idx: usize) -> (usize, usize) {
@@ -270,6 +329,84 @@ mod tests {
         let merged = merge_word_hypotheses(&base, &cond);
         let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
         assert_eq!(text, vec!["hello", "world"]);
+    }
+
+    fn timed(text: &str, start: f32, end: f32) -> Word {
+        Word {
+            word: text.to_string(),
+            start,
+            end,
+            probability: 0.9,
+        }
+    }
+
+    #[test]
+    fn test_merge_word_hypotheses_matched_words_keep_base_timing() {
+        let base = vec![timed("hello", 1.0, 1.5), timed("world", 1.6, 2.0)];
+        let cond = vec![timed("Hello", 9.0, 9.5), timed("world", 9.6, 10.0)];
+        let merged = merge_word_hypotheses(&base, &cond);
+        assert_eq!(merged[0].word, "Hello", "conditioned spelling is kept");
+        assert_eq!((merged[0].start, merged[0].end), (1.0, 1.5));
+        assert_eq!((merged[1].start, merged[1].end), (1.6, 2.0));
+    }
+
+    #[test]
+    fn test_is_monotonic() {
+        let ordered = vec![
+            timed("a", 0.0, 0.5),
+            timed("b", 0.5, 1.0),
+            timed("c", 0.95, 1.2),
+        ];
+        assert!(is_monotonic(&ordered, 0.1));
+        let backwards = vec![
+            timed("e", 29.84, 29.84),
+            timed("interpretação", 24.84, 25.44),
+        ];
+        assert!(!is_monotonic(&backwards, 0.1));
+        assert!(is_monotonic(&[], 0.1));
+    }
+
+    #[test]
+    fn test_copied_from_prompt_ratio_flags_a_prompt_loop() {
+        let prompt = "Programa agrícola sobre milho híbrido e silagem.".repeat(3);
+        let base = words(&[
+            ("tradução", 0.9),
+            ("simultânea", 0.9),
+            ("e", 0.9),
+            ("legendagem", 0.9),
+            ("em", 0.9),
+            ("tempo", 0.9),
+            ("real", 0.9),
+        ]);
+        let cond = words(&[
+            ("tradução", 0.9),
+            ("simultânea", 0.9),
+            ("e", 0.9),
+            ("silagem", 0.99),
+            (".", 0.99),
+            ("Programa", 0.99),
+            ("agrícola", 0.99),
+            ("sobre", 0.99),
+            ("milho", 0.99),
+            ("híbrido", 0.99),
+        ]);
+        assert!(copied_from_prompt_ratio(&base, &cond, &prompt) > 0.5);
+    }
+
+    #[test]
+    fn test_copied_from_prompt_ratio_ignores_prompt_text_also_in_base() {
+        // The speech really contains the prompt's wording, so the baseline does too.
+        let prompt = "uma startup focada em inteligência artificial";
+        let base = words(&[
+            ("uma", 0.9),
+            ("startup", 0.9),
+            ("focada", 0.9),
+            ("em", 0.9),
+            ("inteligência", 0.9),
+            ("artificial", 0.9),
+        ]);
+        let cond = base.clone();
+        assert_eq!(copied_from_prompt_ratio(&base, &cond, prompt), 0.0);
     }
 
     #[test]

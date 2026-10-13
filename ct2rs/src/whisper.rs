@@ -88,8 +88,9 @@ pub struct WhisperConditioning<'a> {
     ///
     /// Conditioning is a soft bias on decoding: each chunk is decoded both with and without it
     /// and the two transcripts are reconciled word by word, keeping a conditioned word only where
-    /// it's an improvement and never accepting content conditioning dropped outright (see
-    /// [`Whisper::generate_segments_conditioned`]).
+    /// it's an improvement and never accepting content conditioning dropped outright. A chunk
+    /// whose conditioned decode just copies the prompt falls back to the unconditioned transcript
+    /// (see [`Whisper::generate_segments_conditioned`]).
     pub initial_prompt: Option<&'a str>,
     /// Optional hint words/phrases biasing decoding toward specific vocabulary or spellings.
     /// Tokenized once and prepended (via `<|startofprev|>`, before `initial_prompt`'s tokens) to
@@ -236,7 +237,9 @@ impl Whisper {
     ///   When either is set, each chunk is decoded twice (with and without conditioning) and the
     ///   two transcripts are reconciled word by word: a conditioned word is kept only where it's
     ///   more confident than the baseline, and content conditioning drops entirely is never
-    ///   accepted, at roughly 2x the decode and alignment cost for those chunks.
+    ///   accepted, at roughly 2x the decode and alignment cost for those chunks. A chunk whose
+    ///   conditioned decode copies the prompt instead of transcribing the audio, or whose merged
+    ///   word timings go backwards, keeps the baseline transcript.
     ///
     /// # Returns
     /// Returns a `Result` containing a vector of transcribed `Segment`s if successful,

@@ -11,9 +11,22 @@
 
 use anyhow::{anyhow, Result};
 
-use super::reconciliation::{join_words, merge_word_hypotheses};
+use super::reconciliation::{
+    copied_from_prompt_ratio, is_monotonic, join_words, merge_word_hypotheses,
+};
 use super::{group_tokens_into_words, is_special_token, process_word_timings};
 use super::{sys, Segment, Tokenizer, Whisper, WhisperOptions, Word};
+
+/// Above this fraction of conditioned words copied from the prompt (see
+/// [`copied_from_prompt_ratio`]), the conditioned decode is treated as having stopped following
+/// the audio, and the chunk keeps the baseline transcript.
+const MAX_COPIED_FROM_PROMPT_RATIO: f32 = 0.25;
+
+/// How far back (in seconds) a merged word may start relative to the previous one before the
+/// merge is rejected as mixing two disagreeing alignments. Words kept from different passes can
+/// be a few hundred milliseconds out of order (e.g. a conditioned filler word next to baseline
+/// punctuation); a derailed pass is off by several seconds.
+const MAX_BACKWARD_JUMP_SECS: f32 = 1.0;
 
 impl Whisper {
     /// Decodes and aligns a single prompt for every chunk, with no conditioning involved. This is
@@ -82,6 +95,11 @@ impl Whisper {
     /// its local confidence improved, and content conditioning dropped entirely is never accepted
     /// silently: the baseline's words are used for that span instead.
     ///
+    /// A chunk keeps its baseline transcript unchanged when the conditioned decode stopped
+    /// following the audio and started copying the prompt (see [`copied_from_prompt_ratio`]),
+    /// or when the merged words go back in time because the two alignments disagree. A copying
+    /// decoder is very confident, so word-level confidence alone can't catch it.
+    ///
     /// Cost: roughly 2x decode and 2x alignment work for chunks that use conditioning (nothing
     /// extra when `initial_prompt`/`hotwords` aren't set, since this path isn't taken then).
     pub(super) fn generate_segments_with_conditioning(
@@ -123,6 +141,11 @@ impl Whisper {
             num_chunks,
         )?;
 
+        // The conditioning content sits between `<|startofprev|>` and the baseline sot sequence.
+        let conditioning_text = self.tokenizer.decode(
+            conditioned_prompt[1..conditioned_prompt.len() - baseline_prompt.len()].to_vec(),
+        )?;
+
         let mut segments = Vec::with_capacity(num_chunks);
         for chunk_idx in 0..num_chunks {
             let chunk_offset =
@@ -139,7 +162,16 @@ impl Whisper {
                 chunk_offset,
             )?;
 
-            let words = merge_word_hypotheses(&base_words, &cond_words);
+            let copied_ratio =
+                copied_from_prompt_ratio(&base_words, &cond_words, &conditioning_text);
+            let merged = merge_word_hypotheses(&base_words, &cond_words);
+            let words = if copied_ratio > MAX_COPIED_FROM_PROMPT_RATIO
+                || !is_monotonic(&merged, MAX_BACKWARD_JUMP_SECS)
+            {
+                base_words
+            } else {
+                merged
+            };
             let seg_start = words.first().map(|w| w.start).unwrap_or(chunk_offset);
             let seg_end = words.last().map(|w| w.end).unwrap_or(chunk_offset);
             let text = join_words(&words);
