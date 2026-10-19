@@ -1,4 +1,4 @@
-//! `initial_prompt`/`hotwords` conditioning for [`super::Whisper::generate_segments_conditioned`].
+//! `initial_prompt`/`hotwords` conditioning for [`super::Whisper::generate_segments`].
 //!
 //! Builds the `<|startofprev|>`-prefixed prompt tokens for `initial_prompt`/`hotwords`, mirroring
 //! faster-whisper's `get_prompt` token order but applied identically to every chunk (no rolling
@@ -30,7 +30,7 @@ const MAX_BACKWARD_JUMP_SECS: f32 = 1.0;
 
 impl Whisper {
     /// Decodes and aligns a single prompt for every chunk, with no conditioning involved. This is
-    /// the path used whenever `initial_prompt`/`hotwords` are both `None`.
+    /// the path used whenever `initial_prompt`/`hotwords` are both blank.
     pub(super) fn generate_segments_plain(
         &self,
         encoder_output: &sys::StorageView,
@@ -230,23 +230,24 @@ impl Whisper {
         Ok((final_words, spaces))
     }
 
-    /// Builds the `<|startofprev|>`-prefixed conditioning tokens for `hotwords`/`initial_prompt`,
-    /// mirroring faster-whisper's `get_prompt` token order, but applied identically to every chunk
-    /// (no rolling previous-text conditioning). At most `budget` content tokens are kept in total
-    /// (see [`conditioning_token_budget`] and [`fit_to_budget`]). Blank (empty/whitespace-only)
-    /// text counts as not provided. Returns an empty vector if neither is provided, in which case
+    /// Builds the `<|startofprev|>`-prefixed conditioning tokens for `options.hotwords`/
+    /// `options.initial_prompt`, mirroring faster-whisper's `get_prompt` token order, but applied
+    /// identically to every chunk (no rolling previous-text conditioning). At most
+    /// [`conditioning_token_budget`] content tokens are kept in total for a start-of-transcript
+    /// sequence `sot_len` tokens long (see [`fit_to_budget`]). Blank (empty/whitespace-only) text
+    /// counts as not provided. Returns an empty vector if neither is provided, in which case
     /// callers see no behavior change at all.
     pub(super) fn build_conditioning_prefix(
         &self,
-        initial_prompt: Option<&str>,
-        hotwords: Option<&str>,
-        budget: usize,
+        options: &WhisperOptions,
+        sot_len: usize,
     ) -> Result<Vec<String>> {
-        let initial_prompt = non_blank(initial_prompt);
-        let hotwords = non_blank(hotwords);
+        let initial_prompt = non_blank(&options.initial_prompt);
+        let hotwords = non_blank(&options.hotwords);
         if initial_prompt.is_none() && hotwords.is_none() {
             return Ok(Vec::new());
         }
+        let budget = conditioning_token_budget(options.max_length, sot_len);
 
         let hotwords_tokens = hotwords.map(|hw| self.encode_raw(hw)).transpose()?;
         let prompt_tokens = initial_prompt
@@ -308,8 +309,8 @@ impl Whisper {
 
 /// Treats empty/whitespace-only text as absent, so e.g. a blank form field or an empty proto3
 /// `string` can't trigger conditioning with no actual content.
-fn non_blank(text: Option<&str>) -> Option<&str> {
-    text.filter(|t| !t.trim().is_empty())
+fn non_blank(text: &str) -> Option<&str> {
+    Some(text).filter(|t| !t.trim().is_empty())
 }
 
 /// Maximum number of `hotwords` + `initial_prompt` content tokens for a decode whose
@@ -354,10 +355,9 @@ mod tests {
 
     #[test]
     fn test_non_blank_treats_empty_and_whitespace_as_absent() {
-        assert_eq!(non_blank(None), None);
-        assert_eq!(non_blank(Some("")), None);
-        assert_eq!(non_blank(Some(" \t\n")), None);
-        assert_eq!(non_blank(Some(" Kubernetes ")), Some(" Kubernetes "));
+        assert_eq!(non_blank(""), None);
+        assert_eq!(non_blank(" \t\n"), None);
+        assert_eq!(non_blank(" Kubernetes "), Some(" Kubernetes "));
     }
 
     fn tokens(prefix: &str, n: usize) -> Vec<String> {

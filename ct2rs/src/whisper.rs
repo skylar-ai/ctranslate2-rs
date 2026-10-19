@@ -55,51 +55,6 @@ pub struct Segment {
 
 pub use super::sys::WhisperOptions;
 
-/// Optional content-conditioning inputs for [`Whisper::generate_segments_conditioned`].
-///
-/// Kept separate from [`WhisperOptions`] so that adding them doesn't change that struct's shape:
-/// existing `WhisperOptions { .. }` struct literals keep compiling, and conditioning is only
-/// applied when a caller explicitly opts in. Both fields default to `None`, and leaving both
-/// `None` makes [`Whisper::generate_segments_conditioned`] behave exactly like
-/// [`Whisper::generate_segments`].
-///
-/// Together, `hotwords` and `initial_prompt` may use at most about half of the decoder's
-/// `max_length` context (218 tokens with the default `max_length` of 448), so the conditioned
-/// decode keeps the same output budget as the plain one. Longer text is truncated rather than
-/// rejected: hotwords keep their beginning and the initial prompt its end, each keeping at least
-/// half of that budget when both are long.
-///
-/// # Examples
-///
-/// ```
-/// use ct2rs::WhisperConditioning;
-///
-/// let conditioning = WhisperConditioning {
-///     hotwords: Some("Kubernetes"),
-///     ..Default::default()
-/// };
-/// ```
-#[derive(Clone, Copy, Debug, Default)]
-pub struct WhisperConditioning<'a> {
-    /// Optional free-form context text (e.g. topic, prior conversation). Tokenized once and
-    /// prepended (via `<|startofprev|>`) to the decoder prompt used for **every** ~30s chunk.
-    /// Unlike faster-whisper's `condition_on_previous_text`, this is a static prefix reused
-    /// identically across chunks — it is not updated with each chunk's own transcribed output.
-    ///
-    /// Conditioning is a soft bias on decoding: each chunk is decoded both with and without it
-    /// and the two transcripts are reconciled word by word, keeping a conditioned word only where
-    /// it's an improvement and never accepting content conditioning dropped outright. A chunk
-    /// whose conditioned decode just copies the prompt falls back to the unconditioned transcript
-    /// (see [`Whisper::generate_segments_conditioned`]).
-    pub initial_prompt: Option<&'a str>,
-    /// Optional hint words/phrases biasing decoding toward specific vocabulary or spellings.
-    /// Tokenized once and prepended (via `<|startofprev|>`, before `initial_prompt`'s tokens) to
-    /// the decoder prompt used for every chunk.
-    ///
-    /// Same per-chunk word-level reconciliation as `initial_prompt` applies here too.
-    pub hotwords: Option<&'a str>,
-}
-
 const PREPROCESSOR_CONFIG_FILE: &str = "preprocessor_config.json";
 
 /// A speach transcriber using the Whisper speech recognition model published by OpenAI.
@@ -158,7 +113,8 @@ impl Whisper {
     /// * `language` - An optional language setting. It transcribes assuming the specified language.
     ///   If `None`, it uses Whisper's language detection.
     /// * `timestamp` - If `true`, the output will include timestamps.
-    /// * `options` - Settings.
+    /// * `options` - Settings. `initial_prompt` and `hotwords` are ignored here; use
+    ///   [`generate_segments`][Whisper::generate_segments] to apply them.
     ///
     /// # Returns
     /// Returns a `Result` containing a vector of transcribed strings if successful,
@@ -209,7 +165,14 @@ impl Whisper {
     ///   [`n_samples`][Whisper::n_samples] method, they will be processed in segments.
     /// * `language` - An optional language setting. It generates segments assuming the specified language.
     ///   If `None`, it uses Whisper's language detection.
-    /// * `options` - Settings.
+    /// * `options` - Settings. When [`initial_prompt`][WhisperOptions::initial_prompt] and
+    ///   [`hotwords`][WhisperOptions::hotwords] are both blank, each chunk is decoded once. When
+    ///   either is set, each chunk is decoded twice (with and without conditioning) and the two
+    ///   transcripts are reconciled word by word: a conditioned word is kept only where it's more
+    ///   confident than the baseline, and content conditioning drops entirely is never accepted,
+    ///   at roughly 2x the decode and alignment cost for those chunks. A chunk whose conditioned
+    ///   decode copies the prompt instead of transcribing the audio, or whose merged word timings
+    ///   go backwards, keeps the baseline transcript.
     ///
     /// # Returns
     /// Returns a `Result` containing a vector of transcribed `Segment`s if successful,
@@ -219,37 +182,6 @@ impl Whisper {
         samples: &[f32],
         language: Option<&str>,
         options: &WhisperOptions,
-    ) -> Result<Vec<Segment>> {
-        self.generate_segments_conditioned(samples, language, options, &Default::default())
-    }
-
-    /// Like [`generate_segments`][Whisper::generate_segments], but optionally biases
-    /// transcription with `initial_prompt`/`hotwords` conditioning.
-    ///
-    /// # Arguments
-    /// * `samples` - Samples of the source audio, as for
-    ///   [`generate_segments`][Whisper::generate_segments].
-    /// * `language` - An optional language setting. It generates segments assuming the specified language.
-    ///   If `None`, it uses Whisper's language detection.
-    /// * `options` - Settings.
-    /// * `conditioning` - Optional `initial_prompt`/`hotwords` (see [`WhisperConditioning`]). When
-    ///   both are `None`, this is identical to [`generate_segments`][Whisper::generate_segments].
-    ///   When either is set, each chunk is decoded twice (with and without conditioning) and the
-    ///   two transcripts are reconciled word by word: a conditioned word is kept only where it's
-    ///   more confident than the baseline, and content conditioning drops entirely is never
-    ///   accepted, at roughly 2x the decode and alignment cost for those chunks. A chunk whose
-    ///   conditioned decode copies the prompt instead of transcribing the audio, or whose merged
-    ///   word timings go backwards, keeps the baseline transcript.
-    ///
-    /// # Returns
-    /// Returns a `Result` containing a vector of transcribed `Segment`s if successful,
-    /// or an error if the segment generation fails.
-    pub fn generate_segments_conditioned(
-        &self,
-        samples: &[f32],
-        language: Option<&str>,
-        options: &WhisperOptions,
-        conditioning: &WhisperConditioning,
     ) -> Result<Vec<Segment>> {
         let (mut mel_spectrogram, num_chunks) = self.generate_mel_spectrogram(samples)?;
         if num_chunks == 0 {
@@ -271,11 +203,7 @@ impl Whisper {
         let sot_sequence = self.generate_prompt(&lang_token, true);
         let baseline_prompt: Vec<String> = sot_sequence.iter().map(|t| t.to_string()).collect();
 
-        let conditioning_prefix = self.build_conditioning_prefix(
-            conditioning.initial_prompt,
-            conditioning.hotwords,
-            conditioning::conditioning_token_budget(options.max_length, baseline_prompt.len()),
-        )?;
+        let conditioning_prefix = self.build_conditioning_prefix(options, baseline_prompt.len())?;
 
         if conditioning_prefix.is_empty() {
             return self.generate_segments_plain(
@@ -844,13 +772,6 @@ mod tests_grouping {
     }
 
     #[test]
-    fn test_default_whisper_conditioning_is_empty() {
-        let conditioning = super::WhisperConditioning::default();
-        assert!(conditioning.initial_prompt.is_none());
-        assert!(conditioning.hotwords.is_none());
-    }
-
-    #[test]
     fn test_process_word_timings() {
         use crate::sys::WhisperTokenAlignment;
 
@@ -1155,13 +1076,12 @@ mod tests {
             .generate_segments(&samples, Some("en"), &Default::default())
             .unwrap();
 
-        let conditioning = super::WhisperConditioning {
-            initial_prompt: Some("A recording used for telephone audio quality testing."),
-            hotwords: Some("OSR"),
+        let options = super::WhisperOptions {
+            initial_prompt: "A recording used for telephone audio quality testing.".to_string(),
+            hotwords: "OSR".to_string(),
+            ..Default::default()
         };
-        let conditioned = w
-            .generate_segments_conditioned(&samples, Some("en"), &Default::default(), &conditioning)
-            .unwrap();
+        let conditioned = w.generate_segments(&samples, Some("en"), &options).unwrap();
 
         assert!(
             !conditioned.is_empty(),
@@ -1211,8 +1131,8 @@ mod tests {
         .unwrap()
     }
 
-    /// Unset (or blank) conditioning must be a true no-op: byte-for-byte the same segments, word
-    /// timings and probabilities as plain `generate_segments`.
+    /// Blank `initial_prompt`/`hotwords` must be a true no-op: byte-for-byte the same segments,
+    /// word timings and probabilities as `generate_segments` with default options.
     ///
     /// That comparison is only meaningful on a backend that reproduces its own output for
     /// identical calls. Some don't (e.g. multithreaded OpenBLAS on Windows), so the check is
@@ -1222,7 +1142,7 @@ mod tests {
     fn test_whisper_unset_conditioning_is_identical_to_plain() {
         let w = load_test_model();
         let samples = load_test_audio(&w);
-        let options = Default::default();
+        let options = super::WhisperOptions::default();
 
         let plain = w.generate_segments(&samples, Some("en"), &options).unwrap();
         assert!(!plain.is_empty());
@@ -1231,18 +1151,13 @@ mod tests {
             return;
         }
 
-        for conditioning in [
-            super::WhisperConditioning::default(),
-            super::WhisperConditioning {
-                initial_prompt: Some(""),
-                hotwords: Some(" \n"),
-            },
-        ] {
-            let conditioned = w
-                .generate_segments_conditioned(&samples, Some("en"), &options, &conditioning)
-                .unwrap();
-            assert_eq!(conditioned, plain, "{conditioning:?} changed the output");
-        }
+        let blank = super::WhisperOptions {
+            initial_prompt: "".to_string(),
+            hotwords: " \n".to_string(),
+            ..Default::default()
+        };
+        let conditioned = w.generate_segments(&samples, Some("en"), &blank).unwrap();
+        assert_eq!(conditioned, plain, "blank conditioning changed the output");
     }
 
     /// Set conditioning must actually reach the decoder prompt: `<|startofprev|>`, then the
@@ -1250,15 +1165,20 @@ mod tests {
     #[test]
     fn test_whisper_conditioning_prefix_contains_hotwords_then_initial_prompt() {
         let w = load_test_model();
+        let options = |initial_prompt: &str, hotwords: &str| super::WhisperOptions {
+            initial_prompt: initial_prompt.to_string(),
+            hotwords: hotwords.to_string(),
+            ..Default::default()
+        };
 
         let prefix = w
-            .build_conditioning_prefix(Some("telephone audio"), Some("OSR"), 218)
+            .build_conditioning_prefix(&options("telephone audio", "OSR"), 3)
             .unwrap();
         assert_eq!(prefix[0], "<|startofprev|>");
         let decoded = w.tokenizer.decode(prefix[1..].to_vec()).unwrap();
         assert_eq!(decoded.trim(), "OSR telephone audio");
 
-        let only_hotwords = w.build_conditioning_prefix(None, Some("OSR"), 218).unwrap();
+        let only_hotwords = w.build_conditioning_prefix(&options("", "OSR"), 3).unwrap();
         assert_eq!(only_hotwords[0], "<|startofprev|>");
         assert_eq!(
             w.tokenizer
@@ -1269,11 +1189,15 @@ mod tests {
         );
 
         assert!(w
-            .build_conditioning_prefix(None, None, 218)
+            .build_conditioning_prefix(&super::WhisperOptions::default(), 3)
             .unwrap()
             .is_empty());
         assert!(w
-            .build_conditioning_prefix(Some("  "), Some(""), 218)
+            .build_conditioning_prefix(&options("  ", ""), 3)
+            .unwrap()
+            .is_empty());
+        assert!(w
+            .build_conditioning_prefix(&options("", " \n"), 3)
             .unwrap()
             .is_empty());
     }
@@ -1284,30 +1208,24 @@ mod tests {
     #[test]
     fn test_whisper_oversized_conditioning_fits_decoder_context() {
         let w = load_test_model();
-        let options = super::WhisperOptions::default();
         let long_prompt = "A recording used for telephone audio quality testing. ".repeat(200);
         let long_hotwords = "OSR, telephone, harvard sentences, ".repeat(200);
 
         for (initial_prompt, hotwords) in [
-            (Some(long_prompt.as_str()), None),
-            (None, Some(long_hotwords.as_str())),
-            (Some(long_prompt.as_str()), Some(long_hotwords.as_str())),
+            (long_prompt.as_str(), ""),
+            ("", long_hotwords.as_str()),
+            (long_prompt.as_str(), long_hotwords.as_str()),
         ] {
-            let prefix = w
-                .build_conditioning_prefix(
-                    initial_prompt,
-                    hotwords,
-                    super::conditioning::conditioning_token_budget(options.max_length, 3),
-                )
-                .unwrap();
+            let options = super::WhisperOptions {
+                initial_prompt: initial_prompt.to_string(),
+                hotwords: hotwords.to_string(),
+                ..Default::default()
+            };
+            let prefix = w.build_conditioning_prefix(&options, 3).unwrap();
             assert!(prefix.len() + 3 <= options.max_length / 2 - 2);
 
-            let conditioning = super::WhisperConditioning {
-                initial_prompt,
-                hotwords,
-            };
             for samples in [vec![0.0f32; w.n_samples()], load_test_audio(&w)] {
-                w.generate_segments_conditioned(&samples, Some("en"), &options, &conditioning)
+                w.generate_segments(&samples, Some("en"), &options)
                     .unwrap_or_else(|e| panic!("oversized conditioning failed: {e:#}"));
             }
         }
@@ -1350,13 +1268,12 @@ mod tests {
     fn test_whisper_conditioned_segments_attach_punctuation() {
         let w = load_test_model();
         let samples = load_test_audio(&w);
-        let conditioning = super::WhisperConditioning {
-            initial_prompt: Some("A recording used for telephone audio quality testing."),
-            hotwords: Some("OSR"),
+        let options = super::WhisperOptions {
+            initial_prompt: "A recording used for telephone audio quality testing.".to_string(),
+            hotwords: "OSR".to_string(),
+            ..Default::default()
         };
-        let segments = w
-            .generate_segments_conditioned(&samples, Some("en"), &Default::default(), &conditioning)
-            .unwrap();
+        let segments = w.generate_segments(&samples, Some("en"), &options).unwrap();
         assert_punctuation_attached(&segments);
     }
 

@@ -128,8 +128,8 @@ for more information.
 
 ## Whisper Prompt Conditioning
 
-`Whisper::generate_segments_conditioned` accepts a `WhisperConditioning` with an optional
-`initial_prompt` and `hotwords` to bias transcription toward known vocabulary, such as proper nouns or domain-specific
+`Whisper::generate_segments` reads the `initial_prompt` and `hotwords` fields of `WhisperOptions` (empty by default)
+to bias transcription toward known vocabulary, such as proper nouns or domain-specific
 terms the model would otherwise misspell.
 Please refer to the [example code](ct2rs/examples/whisper_hotwords.rs)
 for more information, or [ADR-001](ct2rs/docs/adr/001-word-level-reconciliation-for-whisper-conditioning.md)

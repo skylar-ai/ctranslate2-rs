@@ -2,8 +2,8 @@
 
 //! Compare Whisper transcription with and without `initial_prompt`/`hotwords` conditioning.
 //!
-//! `WhisperConditioning::initial_prompt` and `WhisperConditioning::hotwords` bias
-//! `Whisper::generate_segments_conditioned` toward known vocabulary, such as proper nouns or
+//! `WhisperOptions::initial_prompt` and `WhisperOptions::hotwords` bias
+//! `Whisper::generate_segments` toward known vocabulary, such as proper nouns or
 //! domain-specific terms the model would otherwise misspell. This example transcribes the
 //! same audio twice, once with default options and once with conditioning applied, and prints
 //! both so the difference can be compared directly.
@@ -21,7 +21,7 @@ use anyhow::Result;
 use clap::Parser;
 use hound::WavReader;
 
-use ct2rs::{Whisper, WhisperConditioning};
+use ct2rs::{Whisper, WhisperOptions};
 
 #[cfg(not(feature = "whisper"))]
 compile_error!("This example requires 'whisper' feature.");
@@ -55,16 +55,12 @@ fn main() -> Result<()> {
     let baseline = whisper.generate_segments(&samples, language, &Default::default())?;
     let baseline_text: String = baseline.iter().map(|s| s.text.as_str()).collect();
 
-    let conditioning = WhisperConditioning {
-        initial_prompt: args.initial_prompt.as_deref(),
-        hotwords: args.hotwords.as_deref(),
+    let options = WhisperOptions {
+        initial_prompt: args.initial_prompt.unwrap_or_default(),
+        hotwords: args.hotwords.unwrap_or_default(),
+        ..Default::default()
     };
-    let conditioned = whisper.generate_segments_conditioned(
-        &samples,
-        language,
-        &Default::default(),
-        &conditioning,
-    )?;
+    let conditioned = whisper.generate_segments(&samples, language, &options)?;
     let conditioned_text: String = conditioned.iter().map(|s| s.text.as_str()).collect();
 
     println!("--- WITHOUT initial_prompt/hotwords ---\n{baseline_text}\n");

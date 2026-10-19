@@ -5,6 +5,10 @@
 - **Deciders**: Lucas Guerreiro
 - **Tags**: whisper, accuracy, decoding
 
+> **2026-10-19:** `WhisperConditioning` and `Whisper::generate_segments_conditioned` were removed.
+> `initial_prompt` and `hotwords` are now `String` fields on `WhisperOptions` (empty = unset), read by
+> `Whisper::generate_segments`. The reconciliation decided here is unchanged.
+
 ## Context and Problem Statement
 
 `WhisperConditioning::initial_prompt`/`hotwords` bias `Whisper::generate_segments_conditioned` toward known
