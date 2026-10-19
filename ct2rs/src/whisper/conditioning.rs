@@ -58,7 +58,7 @@ impl Whisper {
             // returns the newly generated continuation (see `WhisperReplica::generate` in
             // `CTranslate2/src/models/whisper.cc`). That leading task token is filtered out
             // below like any other special token.
-            let words = self.words_from_tokens(tokens, align_res, chunk_offset)?;
+            let (words, _) = self.words_from_tokens(tokens, align_res, chunk_offset)?;
 
             let clean_tokens: Vec<String> = tokens
                 .iter()
@@ -151,12 +151,12 @@ impl Whisper {
             let chunk_offset =
                 (chunk_idx * self.config.n_samples) as f32 / self.config.sampling_rate as f32;
 
-            let cond_words = self.words_from_tokens(
+            let (cond_words, cond_spaces) = self.words_from_tokens(
                 &conditioned_results[chunk_idx].sequences[0],
                 &conditioned_alignments[chunk_idx],
                 chunk_offset,
             )?;
-            let base_words = self.words_from_tokens(
+            let (base_words, base_spaces) = self.words_from_tokens(
                 &baseline_results[chunk_idx].sequences[0],
                 &baseline_alignments[chunk_idx],
                 chunk_offset,
@@ -164,17 +164,25 @@ impl Whisper {
 
             let copied_ratio =
                 copied_from_prompt_ratio(&base_words, &cond_words, &conditioning_text);
-            let merged = merge_word_hypotheses(&base_words, &cond_words);
-            let words = if copied_ratio > MAX_COPIED_FROM_PROMPT_RATIO
+            let picks = merge_word_hypotheses(&base_words, &cond_words);
+            let merged: Vec<Word> = picks
+                .iter()
+                .map(|pick| pick.word(&base_words, &cond_words))
+                .collect();
+            let (words, spaces) = if copied_ratio > MAX_COPIED_FROM_PROMPT_RATIO
                 || !is_monotonic(&merged, MAX_BACKWARD_JUMP_SECS)
             {
-                base_words
+                (base_words, base_spaces)
             } else {
-                merged
+                let spaces = picks
+                    .iter()
+                    .map(|pick| pick.space_before(&base_spaces, &cond_spaces))
+                    .collect();
+                (merged, spaces)
             };
             let seg_start = words.first().map(|w| w.start).unwrap_or(chunk_offset);
             let seg_end = words.last().map(|w| w.end).unwrap_or(chunk_offset);
-            let text = join_words(&words);
+            let text = join_words(&words, &spaces);
 
             segments.push(Segment {
                 id: chunk_idx,
@@ -189,14 +197,17 @@ impl Whisper {
     }
 
     /// Extracts word-level text, timing and per-word confidence for one chunk from its decoded
-    /// tokens and matching DTW alignment.
+    /// tokens and matching DTW alignment, with punctuation attached to its neighbouring word (see
+    /// [`group_tokens_into_words`]). Alongside each word, returns whether a space precedes it in
+    /// the transcript, for [`join_words`].
     fn words_from_tokens(
         &self,
         tokens: &[String],
         align_res: &sys::WhisperAlignmentResult,
         chunk_offset: f32,
-    ) -> Result<Vec<Word>> {
-        let word_token_ranges = group_tokens_into_words(tokens);
+    ) -> Result<(Vec<Word>, Vec<bool>)> {
+        let grouped = group_tokens_into_words(tokens, |t| self.tokenizer.decode(t.to_vec()))?;
+        let word_token_ranges: Vec<_> = grouped.iter().map(|w| w.range.clone()).collect();
         let chunk_words = process_word_timings(
             &word_token_ranges,
             &align_res.alignments,
@@ -205,18 +216,18 @@ impl Whisper {
         );
 
         let mut final_words = Vec::new();
-        for (range, mut word) in word_token_ranges.into_iter().zip(chunk_words) {
-            let word_text = self.tokenizer.decode(tokens[range.clone()].to_vec())?;
-            let clean_word_text = word_text.trim().to_string();
-            if clean_word_text.is_empty() {
+        let mut spaces = Vec::new();
+        for (grouped_word, mut word) in grouped.into_iter().zip(chunk_words) {
+            if grouped_word.text.is_empty() {
                 continue;
             }
-            word.word = clean_word_text;
+            word.word = grouped_word.text;
             word.start += chunk_offset;
             word.end += chunk_offset;
             final_words.push(word);
+            spaces.push(grouped_word.space_before);
         }
-        Ok(final_words)
+        Ok((final_words, spaces))
     }
 
     /// Builds the `<|startofprev|>`-prefixed conditioning tokens for `hotwords`/`initial_prompt`,

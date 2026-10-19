@@ -455,7 +455,137 @@ fn is_special_token(token: &str) -> bool {
     token.starts_with("<|") && token.ends_with("|>")
 }
 
-fn group_tokens_into_words(tokens: &[String]) -> Vec<std::ops::Range<usize>> {
+/// Whether the token carries the GPT-2/Whisper (`Ġ`) or a plain leading-space marker.
+fn has_leading_space(token: &str) -> bool {
+    token.starts_with('Ġ') || token.starts_with(' ')
+}
+
+/// Characters that, standing alone after a space, open the word that follows them instead of
+/// closing the one before (openai-whisper's default `prepend_punctuations`).
+const OPENING_PUNCTUATION: &[char] = &['"', '\'', '“', '¿', '(', '[', '{', '-'];
+
+/// A word of a decoded chunk: its token range, its display text, and whether a space precedes it.
+#[derive(Clone, Debug, PartialEq)]
+struct WordTokens {
+    range: std::ops::Range<usize>,
+    /// Decoded, trimmed text. Absorbed punctuation is attached without the space it may have
+    /// been decoded with, so a word never contains whitespace it didn't already have.
+    text: String,
+    /// Whether the word's first token carries a leading-space marker.
+    space_before: bool,
+}
+
+/// How a piece produced by [`split_tokens_into_pieces`] takes part in punctuation merging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PieceKind {
+    /// Contains at least one alphanumeric character.
+    Word,
+    /// Punctuation-only after a space, made only of [`OPENING_PUNCTUATION`]: joins the next word.
+    Opening,
+    /// Any other punctuation-only (or whitespace-only) piece: joins the previous word.
+    Trailing,
+}
+
+impl PieceKind {
+    /// Classifies a piece by its decoded `text`, not its raw token strings: Whisper's byte-level
+    /// BPE spells non-ASCII characters as other characters (`，` is `ï¼Į`), which would read as
+    /// letters.
+    fn of(text: &str, first_token: &str) -> Self {
+        if text.chars().any(char::is_alphanumeric) {
+            PieceKind::Word
+        } else if !text.is_empty()
+            && has_leading_space(first_token)
+            && text.chars().all(|c| OPENING_PUNCTUATION.contains(&c))
+        {
+            PieceKind::Opening
+        } else {
+            PieceKind::Trailing
+        }
+    }
+}
+
+/// Groups decoded tokens into words, attaching punctuation to a neighbouring word as
+/// openai-whisper's `merge_punctuations` does: opening punctuation joins the word after it, any
+/// other punctuation-only piece joins the word before it. Merging stays within a run of text
+/// tokens between special tokens; a run with no word in it is returned as split.
+fn group_tokens_into_words(
+    tokens: &[String],
+    mut decode: impl FnMut(&[String]) -> Result<String>,
+) -> Result<Vec<WordTokens>> {
+    let pieces = split_tokens_into_pieces(tokens);
+    let mut words = Vec::with_capacity(pieces.len());
+    for run in pieces.chunk_by(|a, b| a.end == b.start) {
+        let mut classified = Vec::with_capacity(run.len());
+        for range in run {
+            let text = decode(&tokens[range.clone()])?.trim().to_string();
+            let kind = PieceKind::of(&text, &tokens[range.start]);
+            classified.push((range.clone(), text, kind));
+        }
+        merge_punctuation_run(tokens, classified, &mut words);
+    }
+    Ok(words)
+}
+
+/// Appends one run's pieces to `words`, merging its punctuation-only pieces into words (see
+/// [`group_tokens_into_words`]). Punctuation with no word on its usual side joins the other one.
+fn merge_punctuation_run(
+    tokens: &[String],
+    pieces: Vec<(std::ops::Range<usize>, String, PieceKind)>,
+    words: &mut Vec<WordTokens>,
+) {
+    let word_tokens = |range: std::ops::Range<usize>, text: String| WordTokens {
+        space_before: has_leading_space(&tokens[range.start]),
+        range,
+        text,
+    };
+
+    if pieces.iter().all(|(_, _, kind)| *kind != PieceKind::Word) {
+        words.extend(
+            pieces
+                .into_iter()
+                .map(|(range, text, _)| word_tokens(range, text)),
+        );
+        return;
+    }
+
+    let run_start = words.len();
+    let mut run_end = 0;
+    // Punctuation waiting for the next word of this run: its first token index and its text.
+    let mut pending: Option<(usize, String)> = None;
+    for (range, text, kind) in pieces {
+        run_end = range.end;
+        match kind {
+            PieceKind::Word => {
+                let (start, prefix) = pending.take().unwrap_or((range.start, String::new()));
+                words.push(word_tokens(start..range.end, prefix + &text));
+            }
+            PieceKind::Trailing if words.len() > run_start => {
+                let last = words.last_mut().expect("checked above");
+                if let Some((_, waiting)) = pending.take() {
+                    last.text.push_str(&waiting);
+                }
+                last.range.end = range.end;
+                last.text.push_str(&text);
+            }
+            PieceKind::Trailing | PieceKind::Opening => {
+                pending
+                    .get_or_insert_with(|| (range.start, String::new()))
+                    .1
+                    .push_str(&text);
+            }
+        }
+    }
+
+    if let Some((_, waiting)) = pending {
+        let last = words.last_mut().expect("the run contains a word");
+        last.range.end = run_end;
+        last.text.push_str(&waiting);
+    }
+}
+
+/// Splits decoded tokens into pieces at leading-space markers, punctuation and special tokens,
+/// before any punctuation is merged back (see [`group_tokens_into_words`]).
+fn split_tokens_into_pieces(tokens: &[String]) -> Vec<std::ops::Range<usize>> {
     let mut word_ranges = Vec::new();
     let mut current_word_start = None;
 
@@ -602,8 +732,114 @@ mod tests_grouping {
             "Ġworld".to_string(),
             "!".to_string(),
         ];
-        let ranges = group_tokens_into_words(&tokens);
-        assert_eq!(ranges, vec![3..5, 5..6, 6..7]);
+        let words = group_tokens_into_words(&tokens, decode_test_tokens).unwrap();
+        let ranges: Vec<_> = words.iter().map(|w| w.range.clone()).collect();
+        assert_eq!(ranges, vec![3..5, 5..7]);
+        assert_eq!(texts(&words), vec!["Hellollo", "world!"]);
+    }
+
+    /// Stands in for the model tokenizer: `Ġ` decodes to a space and the byte-level spelling of
+    /// `，` to `，`; everything else decodes to itself.
+    fn decode_test_tokens(tokens: &[String]) -> Result<String> {
+        Ok(tokens.concat().replace('Ġ', " ").replace("ï¼Į", "，"))
+    }
+
+    fn group(tokens: &[&str]) -> Vec<WordTokens> {
+        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        group_tokens_into_words(&tokens, decode_test_tokens).unwrap()
+    }
+
+    fn texts(words: &[WordTokens]) -> Vec<&str> {
+        words.iter().map(|w| w.text.as_str()).collect()
+    }
+
+    #[test]
+    fn test_trailing_punctuation_runs_join_previous_word() {
+        assert_eq!(texts(&group(&["Ġworld", "?", "!"])), vec!["world?!"]);
+        assert_eq!(texts(&group(&["Ġworld", ".\""])), vec!["world.\""]);
+    }
+
+    #[test]
+    fn test_any_punctuation_only_word_joins_previous_word() {
+        for (punctuation, expected) in [
+            (";", "wait;"),
+            ("...", "wait..."),
+            ("…", "wait…"),
+            ("Ġ—", "wait—"),
+        ] {
+            assert_eq!(texts(&group(&["Ġwait", punctuation])), vec![expected]);
+        }
+        assert_eq!(texts(&group(&["Ġ50", "%"])), vec!["50%"]);
+    }
+
+    #[test]
+    fn test_punctuation_is_classified_on_decoded_text() {
+        // `Ġï¼Į` decodes to ` ，`: punctuation-only, though its raw characters read as letters.
+        assert_eq!(texts(&group(&["Ġwait", "Ġï¼Į"])), vec!["wait，"]);
+    }
+
+    #[test]
+    fn test_merged_word_timing_and_probability() {
+        use crate::sys::WhisperTokenAlignment;
+
+        let words = group(&["Ġworld", "!"]);
+        let ranges: Vec<_> = words.iter().map(|w| w.range.clone()).collect();
+        assert_eq!(ranges, vec![0..2]);
+
+        let alignments = [(0, 10), (0, 14), (1, 15), (1, 16)]
+            .map(|(token_x, frame_x)| WhisperTokenAlignment { token_x, frame_x });
+        let timed = process_word_timings(&ranges, &alignments, &[0.9, 0.5], 2);
+        assert_eq!(timed.len(), 1);
+        assert_eq!(timed[0].start, 10.0 / 50.0, "start of the `world` token");
+        assert_eq!(timed[0].end, 17.0 / 50.0, "end of the `!` token");
+        assert!((timed[0].probability - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_spaced_opening_punctuation_joins_next_word() {
+        let said = group(&["Ġsaid", "Ġ\"", "Hello"]);
+        assert_eq!(texts(&said), vec!["said", "\"Hello"]);
+        assert!(said[1].space_before);
+        assert_eq!(
+            texts(&group(&["Ġsaid", "Ġ\"", "ĠHello"])),
+            vec!["said", "\"Hello"]
+        );
+        assert_eq!(texts(&group(&["Ġ(", "see"])), vec!["(see"]);
+        assert_eq!(texts(&group(&["Ġ¿", "Qué"])), vec!["¿Qué"]);
+        assert_eq!(
+            texts(&group(&["Ġsee", "Ġ(", "\"", "Hello"])),
+            vec!["see", "(\"Hello"]
+        );
+    }
+
+    #[test]
+    fn test_unspaced_quote_joins_previous_word() {
+        assert_eq!(
+            texts(&group(&["ĠHello", "\"", "Ġthen"])),
+            vec!["Hello\"", "then"]
+        );
+    }
+
+    #[test]
+    fn test_run_edge_punctuation_joins_other_neighbour() {
+        let then = group(&[".", "Ġthen"]);
+        assert_eq!(texts(&then), vec![".then"]);
+        assert!(!then[0].space_before);
+        assert_eq!(texts(&group(&["ĠHello", "Ġ("])), vec!["Hello("]);
+    }
+
+    #[test]
+    fn test_all_punctuation_run_is_unchanged() {
+        assert_eq!(texts(&group(&["..."])), vec!["..."]);
+        assert_eq!(texts(&group(&[".", "!"])), vec![".", "!"]);
+    }
+
+    #[test]
+    fn test_merge_never_crosses_a_special_token() {
+        let words = group(&["Ġworld", "<|5.00|>", ".", "ĠNext"]);
+        let ranges: Vec<_> = words.iter().map(|w| w.range.clone()).collect();
+        assert_eq!(ranges, vec![0..1, 2..4]);
+        assert_eq!(texts(&words), vec!["world", ".Next"]);
     }
 
     #[test]
@@ -1074,5 +1310,80 @@ mod tests {
                     .unwrap_or_else(|e| panic!("oversized conditioning failed: {e:#}"));
             }
         }
+    }
+
+    /// Asserts no segment returns a punctuation-only word next to real words, and that the
+    /// audio's sentence punctuation did reach some word (so the check isn't vacuous).
+    fn assert_punctuation_attached(segments: &[super::Segment]) {
+        let is_punctuation_only = |w: &str| !w.chars().any(char::is_alphanumeric);
+        let mut any_ends_in_punctuation = false;
+        for segment in segments {
+            let words = segment.words.as_deref().unwrap_or_default();
+            if words.iter().all(|w| is_punctuation_only(&w.word)) {
+                continue;
+            }
+            for word in words {
+                assert!(
+                    !is_punctuation_only(&word.word),
+                    "segment {} returned punctuation-only word {:?}",
+                    segment.id,
+                    word.word
+                );
+                any_ends_in_punctuation |= word.word.ends_with(|c: char| c.is_ascii_punctuation());
+            }
+        }
+        assert!(any_ends_in_punctuation, "no word carries punctuation");
+    }
+
+    #[test]
+    fn test_whisper_generate_segments_attaches_punctuation() {
+        let w = load_test_model();
+        let samples = load_test_audio(&w);
+        let segments = w
+            .generate_segments(&samples, Some("en"), &Default::default())
+            .unwrap();
+        assert_punctuation_attached(&segments);
+    }
+
+    #[test]
+    fn test_whisper_conditioned_segments_attach_punctuation() {
+        let w = load_test_model();
+        let samples = load_test_audio(&w);
+        let conditioning = super::WhisperConditioning {
+            initial_prompt: Some("A recording used for telephone audio quality testing."),
+            hotwords: Some("OSR"),
+        };
+        let segments = w
+            .generate_segments_conditioned(&samples, Some("en"), &Default::default(), &conditioning)
+            .unwrap();
+        assert_punctuation_attached(&segments);
+    }
+
+    /// Attaching punctuation to words must not change the unconditioned `Segment.text`, which is
+    /// decoded from the tokens. The expected text was recorded before the change, on the CPU
+    /// `ruy` backend; other backends may legitimately transcribe differently, so they skip.
+    #[test]
+    fn test_whisper_plain_segment_text_matches_base() {
+        if !cfg!(feature = "ruy") || cfg!(feature = "cuda") {
+            eprintln!("skipping: expected text was recorded on the CPU ruy backend");
+            return;
+        }
+        let w = load_test_model();
+        let samples = load_test_audio(&w);
+        let segments = w
+            .generate_segments(&samples, Some("en"), &Default::default())
+            .unwrap();
+        let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "The birch can use lid on the smooth planks. Glue the sheet to the dark blue \
+                 background. It is easy to tell the depth of a well. These days, the chicken leg \
+                 is a rare dish. Rice is also served in round bowls. The juice of lemon makes fine \
+                 punch. The box was thrown beside the pork truck. The hogs were fed chopped corn \
+                 and garbage.",
+                "A large size and stockings is hard to sell.",
+            ]
+        );
     }
 }

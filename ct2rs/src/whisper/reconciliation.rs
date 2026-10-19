@@ -97,20 +97,17 @@ fn word_edit_script(base: &[Word], cond: &[Word]) -> Vec<WordEditOp> {
 ///   average word probability is higher is kept, so a conditioned word only overrides the
 ///   baseline when the model is actually more confident in it, not merely because the prompt
 ///   nudged it there.
-pub(super) fn merge_word_hypotheses(base: &[Word], cond: &[Word]) -> Vec<Word> {
+///
+/// Returns where each merged word comes from rather than the words themselves, so callers can
+/// carry per-word data (such as spacing) along with them; see [`WordPick::word`].
+pub(super) fn merge_word_hypotheses(base: &[Word], cond: &[Word]) -> Vec<WordPick> {
     let ops = word_edit_script(base, cond);
     let mut merged = Vec::with_capacity(ops.len());
 
     let mut idx = 0;
     while idx < ops.len() {
         if let WordEditOp::Match(base_idx, cond_idx) = ops[idx] {
-            // Keep the conditioned spelling but the baseline timing, so a matched word shares
-            // its time base with the baseline-only words around it.
-            merged.push(Word {
-                start: base[base_idx].start,
-                end: base[base_idx].end,
-                ..cond[cond_idx].clone()
-            });
+            merged.push(WordPick::Matched(base_idx, cond_idx));
             idx += 1;
             continue;
         }
@@ -135,15 +132,15 @@ pub(super) fn merge_word_hypotheses(base: &[Word], cond: &[Word]) -> Vec<Word> {
         }
 
         match (base_range, cond_range) {
-            (Some((lo, hi)), None) => merged.extend(base[lo..=hi].iter().cloned()),
-            (None, Some((lo, hi))) => merged.extend(cond[lo..=hi].iter().cloned()),
+            (Some((lo, hi)), None) => merged.extend((lo..=hi).map(WordPick::Base)),
+            (None, Some((lo, hi))) => merged.extend((lo..=hi).map(WordPick::Cond)),
             (Some((base_lo, base_hi)), Some((cond_lo, cond_hi))) => {
                 let base_slice = &base[base_lo..=base_hi];
                 let cond_slice = &cond[cond_lo..=cond_hi];
                 if average_probability(cond_slice) >= average_probability(base_slice) {
-                    merged.extend(cond_slice.iter().cloned());
+                    merged.extend((cond_lo..=cond_hi).map(WordPick::Cond));
                 } else {
-                    merged.extend(base_slice.iter().cloned());
+                    merged.extend((base_lo..=base_hi).map(WordPick::Base));
                 }
             }
             (None, None) => unreachable!("a non-match run must consume at least one side"),
@@ -151,6 +148,41 @@ pub(super) fn merge_word_hypotheses(base: &[Word], cond: &[Word]) -> Vec<Word> {
     }
 
     merged
+}
+
+/// Where one word of [`merge_word_hypotheses`]'s result comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WordPick {
+    /// `base[i]`, as is.
+    Base(usize),
+    /// `cond[j]`, as is.
+    Cond(usize),
+    /// The same word on both sides: `cond[j]`'s spelling with `base[i]`'s timing.
+    Matched(usize, usize),
+}
+
+impl WordPick {
+    /// The merged word. A matched word keeps the conditioned spelling but the baseline timing,
+    /// so it shares its time base with the baseline-only words around it.
+    pub(super) fn word(self, base: &[Word], cond: &[Word]) -> Word {
+        match self {
+            WordPick::Base(i) => base[i].clone(),
+            WordPick::Cond(j) => cond[j].clone(),
+            WordPick::Matched(i, j) => Word {
+                start: base[i].start,
+                end: base[i].end,
+                ..cond[j].clone()
+            },
+        }
+    }
+
+    /// Whether a space precedes the merged word, taken from the side its spelling comes from.
+    pub(super) fn space_before(self, base: &[bool], cond: &[bool]) -> bool {
+        match self {
+            WordPick::Base(i) => base[i],
+            WordPick::Cond(j) | WordPick::Matched(_, j) => cond[j],
+        }
+    }
 }
 
 /// Fraction of `cond`'s words that look copied from the conditioning text rather than heard:
@@ -217,12 +249,14 @@ fn average_probability(words: &[Word]) -> f32 {
     words.iter().map(|w| w.probability).sum::<f32>() / words.len() as f32
 }
 
-/// Joins word-level output back into display text, matching common detokenization practice: no
-/// space is inserted before a "word" that is pure punctuation (e.g. `,`, `.`, `!`).
-pub(super) fn join_words(words: &[Word]) -> String {
+/// Joins word-level output back into display text. `space_before[i]` says whether `words[i]`'s
+/// first token carries a leading-space marker: that is what puts a space before a word opening
+/// with punctuation (`"Hello`) while a split-off contraction piece (`'t` in "don't") or hyphen
+/// continuation (`-R`) attaches directly to what precedes it.
+pub(super) fn join_words(words: &[Word], space_before: &[bool]) -> String {
     let mut text = String::new();
-    for w in words {
-        if !text.is_empty() && starts_with_alphanumeric(&w.word) {
+    for (w, &space) in words.iter().zip(space_before) {
+        if !text.is_empty() && (space || starts_with_alphanumeric(&w.word)) {
             text.push(' ');
         }
         text.push_str(&w.word);
@@ -230,9 +264,8 @@ pub(super) fn join_words(words: &[Word]) -> String {
     text
 }
 
-/// Whether a word should get a leading space when joined after another. Words starting with
-/// punctuation (`,`, `!`, or a split-off contraction piece like `'t` in "don't") attach directly
-/// to what precedes them instead.
+/// Whether a word starts with a letter or digit. Such a word without a leading-space marker only
+/// begins a run (after a special token), where it still needs a space.
 fn starts_with_alphanumeric(word: &str) -> bool {
     word.chars().next().is_some_and(|c| c.is_alphanumeric())
 }
@@ -254,11 +287,50 @@ mod tests {
         pairs.iter().map(|&(w, p)| word(w, p)).collect()
     }
 
+    fn merged_words(base: &[Word], cond: &[Word]) -> Vec<Word> {
+        merge_word_hypotheses(base, cond)
+            .into_iter()
+            .map(|pick| pick.word(base, cond))
+            .collect()
+    }
+
+    #[test]
+    fn test_merge_word_picks_carry_their_side() {
+        // `cond` replaces a garbled word with a more confident one; each pick reports the side
+        // it came from, so the spacing travels with the spelling.
+        let base = words(&[
+            ("said", 0.9),
+            ("\"Helo", 0.2),
+            ("then", 0.9),
+            ("really", 0.9),
+        ]);
+        let cond = words(&[("said", 0.9), ("\"Hello", 0.9), ("then", 0.9)]);
+        let picks = merge_word_hypotheses(&base, &cond);
+        assert_eq!(
+            picks,
+            vec![
+                WordPick::Matched(0, 0),
+                WordPick::Cond(1),
+                WordPick::Matched(2, 2),
+                WordPick::Base(3),
+            ]
+        );
+
+        let base_spaces = [true, true, true, true];
+        let cond_spaces = [true, false, true];
+        let spaces: Vec<bool> = picks
+            .iter()
+            .map(|pick| pick.space_before(&base_spaces, &cond_spaces))
+            .collect();
+        assert_eq!(spaces, vec![true, false, true, true]);
+        assert_eq!(picks[1].word(&base, &cond).word, "\"Hello");
+    }
+
     #[test]
     fn test_merge_word_hypotheses_keeps_matching_words() {
         let base = words(&[("hello", 0.5), ("world", 0.5)]);
         let cond = words(&[("hello", 0.9), ("world", 0.9)]);
-        let merged = merge_word_hypotheses(&base, &cond);
+        let merged = merged_words(&base, &cond);
         let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
         assert_eq!(text, vec!["hello", "world"]);
     }
@@ -277,7 +349,7 @@ mod tests {
             ("day", 0.9),
         ]);
         let cond = words(&[("this", 0.9), ("is", 0.9), ("a", 0.9), ("day", 0.9)]);
-        let merged = merge_word_hypotheses(&base, &cond);
+        let merged = merged_words(&base, &cond);
         let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
         assert_eq!(text, vec!["this", "is", "a", "wonderful", "strange", "day"]);
     }
@@ -287,7 +359,7 @@ mod tests {
         // `cond` replaces "world" with a lower-confidence "word": keep `base`'s word.
         let base = words(&[("hello", 0.9), ("world", 0.85)]);
         let cond = words(&[("hello", 0.9), ("word", 0.2)]);
-        let merged = merge_word_hypotheses(&base, &cond);
+        let merged = merged_words(&base, &cond);
         let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
         assert_eq!(text, vec!["hello", "world"]);
     }
@@ -298,7 +370,7 @@ mod tests {
         // `cond`'s word, i.e. the hotwords use case.
         let base = words(&[("hello", 0.9), ("wrld", 0.3)]);
         let cond = words(&[("hello", 0.9), ("world", 0.95)]);
-        let merged = merge_word_hypotheses(&base, &cond);
+        let merged = merged_words(&base, &cond);
         let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
         assert_eq!(text, vec!["hello", "world"]);
     }
@@ -307,7 +379,7 @@ mod tests {
     fn test_merge_word_hypotheses_keeps_pure_insertion() {
         let base = words(&[("hello", 0.9), ("world", 0.9)]);
         let cond = words(&[("hello", 0.9), ("there", 0.9), ("world", 0.9)]);
-        let merged = merge_word_hypotheses(&base, &cond);
+        let merged = merged_words(&base, &cond);
         let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
         assert_eq!(text, vec!["hello", "there", "world"]);
     }
@@ -316,7 +388,7 @@ mod tests {
     fn test_merge_word_hypotheses_empty_base_keeps_all_conditioned_words() {
         let base: Vec<Word> = vec![];
         let cond = words(&[("hello", 0.9), ("world", 0.9)]);
-        let merged = merge_word_hypotheses(&base, &cond);
+        let merged = merged_words(&base, &cond);
         let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
         assert_eq!(text, vec!["hello", "world"]);
     }
@@ -326,7 +398,7 @@ mod tests {
         // Degenerate case of "conditioning dropped everything": must still recover `base`.
         let base = words(&[("hello", 0.9), ("world", 0.9)]);
         let cond: Vec<Word> = vec![];
-        let merged = merge_word_hypotheses(&base, &cond);
+        let merged = merged_words(&base, &cond);
         let text: Vec<&str> = merged.iter().map(|w| w.word.as_str()).collect();
         assert_eq!(text, vec!["hello", "world"]);
     }
@@ -344,7 +416,7 @@ mod tests {
     fn test_merge_word_hypotheses_matched_words_keep_base_timing() {
         let base = vec![timed("hello", 1.0, 1.5), timed("world", 1.6, 2.0)];
         let cond = vec![timed("Hello", 9.0, 9.5), timed("world", 9.6, 10.0)];
-        let merged = merge_word_hypotheses(&base, &cond);
+        let merged = merged_words(&base, &cond);
         assert_eq!(merged[0].word, "Hello", "conditioned spelling is kept");
         assert_eq!((merged[0].start, merged[0].end), (1.0, 1.5));
         assert_eq!((merged[1].start, merged[1].end), (1.6, 2.0));
@@ -412,19 +484,34 @@ mod tests {
     #[test]
     fn test_join_words_skips_space_before_punctuation() {
         let ws = words(&[("Hello", 0.9), (",", 0.9), ("world", 0.9), ("!", 0.9)]);
-        assert_eq!(join_words(&ws), "Hello, world!");
+        assert_eq!(
+            join_words(&ws, &[true, false, true, false]),
+            "Hello, world!"
+        );
+    }
+
+    #[test]
+    fn test_join_words_spaces_opening_punctuation_word() {
+        let ws = words(&[("she", 0.9), ("said", 0.9), ("\"Hello,\"", 0.9)]);
+        assert_eq!(join_words(&ws, &[true, true, true]), "she said \"Hello,\"");
+
+        let ws = words(&[("Hello,", 0.9), ("world!", 0.9)]);
+        assert_eq!(join_words(&ws, &[true, true]), "Hello, world!");
     }
 
     #[test]
     fn test_join_words_skips_space_before_split_contraction_piece() {
         // "didn't" tokenized as two words, "didn" + "'t", must not get a space in between.
         let ws = words(&[("she", 0.9), ("didn", 0.9), ("'t", 0.9), ("know", 0.9)]);
-        assert_eq!(join_words(&ws), "she didn't know");
+        assert_eq!(
+            join_words(&ws, &[true, true, false, true]),
+            "she didn't know"
+        );
     }
 
     #[test]
     fn test_join_words_skips_space_before_hyphen_continuation() {
         let ws = words(&[("M", 0.9), ("-R", 0.9), ("-C", 0.9), ("-S", 0.9)]);
-        assert_eq!(join_words(&ws), "M-R-C-S");
+        assert_eq!(join_words(&ws, &[true, false, false, false]), "M-R-C-S");
     }
 }
