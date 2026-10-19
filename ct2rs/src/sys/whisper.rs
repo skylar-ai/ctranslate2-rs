@@ -40,19 +40,6 @@ mod ffi {
     ///
     /// let options = WhisperOptions::default();
     /// ```
-    ///
-    /// Biasing [`Whisper::generate_segments`](crate::Whisper::generate_segments) toward known
-    /// vocabulary:
-    ///
-    /// ```
-    /// use ct2rs::WhisperOptions;
-    ///
-    /// let options = WhisperOptions {
-    ///     hotwords: "Kubernetes".to_string(),
-    ///     ..Default::default()
-    /// };
-    /// assert!(options.initial_prompt.is_empty());
-    /// ```
     #[derive(Clone, Debug)]
     pub struct WhisperOptions {
         /// Beam size to use for beam search (set 1 to run greedy search). (default: 5)
@@ -91,50 +78,6 @@ mod ffi {
         /// -1 will suppress a default set of symbols as defined in the model config.json file.
         /// (default: `[-1]`)
         pub suppress_tokens: Vec<i32>,
-        /// Free-form context text (e.g. topic, prior conversation) biasing transcription. Empty or
-        /// whitespace-only means none. (default: `""`)
-        ///
-        /// Only [`Whisper::generate_segments`](crate::Whisper::generate_segments) applies it;
-        /// [`Whisper::generate`](crate::Whisper::generate) and the low-level
-        /// [`Whisper::generate`](crate::sys::Whisper::generate) ignore it. It's tokenized once and
-        /// prepended (via `<|startofprev|>`) to the decoder prompt used for **every** ~30s chunk.
-        /// Unlike faster-whisper's `condition_on_previous_text`, this is a static prefix reused
-        /// identically across chunks — it is not updated with each chunk's own transcribed output.
-        ///
-        /// By default each conditioned chunk is decoded once, as faster-whisper's batched pipeline
-        /// does, and that transcript is returned as-is. Conditioning biases the whole decode, not
-        /// just the target words, so the transcript may omit, copy from the prompt, or translate
-        /// content the unconditioned transcript had. Set
-        /// [`reconcile_conditioning`](WhisperOptions::reconcile_conditioning) to rule that out at
-        /// about twice the cost.
-        ///
-        /// Together, `hotwords` and `initial_prompt` may use at most about half of the decoder's
-        /// `max_length` context (218 tokens with the default `max_length` of 448), so the
-        /// conditioned decode keeps the same output budget as the plain one. Longer text is
-        /// truncated rather than rejected: hotwords keep their beginning and the initial prompt
-        /// its end, each keeping at least half of that budget when both are long.
-        pub initial_prompt: String,
-        /// Hint words/phrases biasing transcription toward specific vocabulary or spellings.
-        /// Empty or whitespace-only means none. (default: `""`)
-        ///
-        /// Applied like `initial_prompt` (only by `Whisper::generate_segments`, with the same token
-        /// budget), with its tokens placed before `initial_prompt`'s after `<|startofprev|>`. By
-        /// default each conditioned chunk is decoded once, so the transcript may omit, copy from the
-        /// prompt, or translate content; see
-        /// [`reconcile_conditioning`](WhisperOptions::reconcile_conditioning).
-        pub hotwords: String,
-        /// Reconciles conditioned transcripts against unconditioned ones. (default: `false`)
-        ///
-        /// Only [`Whisper::generate_segments`](crate::Whisper::generate_segments) reads it, and
-        /// only when [`initial_prompt`](WhisperOptions::initial_prompt) or
-        /// [`hotwords`](WhisperOptions::hotwords) is set. When `true`, each chunk is decoded and
-        /// aligned twice, with and without conditioning, and the two transcripts are merged word by
-        /// word: a conditioned word is kept only where it's more confident, so the result keeps
-        /// every word of the unconditioned transcript, at about 2x decode and alignment cost. A
-        /// chunk whose conditioned decode copies the prompt, or whose merged word timings go
-        /// backwards, keeps the unconditioned transcript. When `false`, each conditioned chunk is
-        /// decoded once and that transcript is used as-is.
-        pub reconcile_conditioning: bool,
     }
 
     struct WhisperGenerationResult {
@@ -256,9 +199,6 @@ impl Default for WhisperOptions {
             max_initial_timestamp_index: 50,
             suppress_blank: true,
             suppress_tokens: vec![-1],
-            initial_prompt: String::new(),
-            hotwords: String::new(),
-            reconcile_conditioning: false,
         }
     }
 }
@@ -607,9 +547,6 @@ mod tests {
         assert_eq!(opts.max_initial_timestamp_index, 50);
         assert!(opts.suppress_blank);
         assert_eq!(opts.suppress_tokens, vec![-1]);
-        assert_eq!(opts.initial_prompt, "");
-        assert_eq!(opts.hotwords, "");
-        assert!(!opts.reconcile_conditioning);
     }
 
     #[test]

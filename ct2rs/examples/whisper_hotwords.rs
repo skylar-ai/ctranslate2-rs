@@ -2,17 +2,17 @@
 
 //! Compare Whisper transcription with and without `initial_prompt`/`hotwords` conditioning.
 //!
-//! `WhisperOptions::initial_prompt` and `WhisperOptions::hotwords` bias
-//! `Whisper::generate_segments` toward known vocabulary, such as proper nouns or
+//! `WhisperConditioning::initial_prompt` and `WhisperConditioning::hotwords` bias
+//! `Whisper::generate_segments_conditioned` toward known vocabulary, such as proper nouns or
 //! domain-specific terms the model would otherwise misspell. This example transcribes the
 //! same audio three times and prints each transcript so they can be compared directly:
 //!
 //! 1. without conditioning;
 //! 2. with single-pass conditioning (the default): each chunk is decoded once with the
 //!    conditioned prompt;
-//! 3. with reconciled conditioning (`WhisperOptions::reconcile_conditioning = true`): each chunk
-//!    is decoded with and without conditioning and the two are merged word by word, at about
-//!    twice the cost.
+//! 3. with reconciled conditioning (`WhisperConditioning::reconcile_conditioning = true`):
+//!    each chunk is decoded with and without conditioning and the two are merged word by word,
+//!    at about twice the cost.
 //!
 //! See the `whisper` example for how to convert and obtain a model.
 //!
@@ -27,7 +27,7 @@ use anyhow::Result;
 use clap::Parser;
 use hound::WavReader;
 
-use ct2rs::{Segment, Whisper, WhisperOptions};
+use ct2rs::{Segment, Whisper, WhisperConditioning, WhisperOptions};
 
 #[cfg(not(feature = "whisper"))]
 compile_error!("This example requires 'whisper' feature.");
@@ -57,24 +57,33 @@ fn main() -> Result<()> {
     let whisper = Whisper::new(args.model_dir, Default::default())?;
     let samples = read_audio(args.audio_file, whisper.sampling_rate())?;
     let language = args.language.as_deref();
+    let options = WhisperOptions::default();
 
-    let baseline = whisper.generate_segments(&samples, language, &Default::default())?;
+    let baseline = whisper.generate_segments(&samples, language, &options)?;
     let baseline_text = transcript(&baseline);
 
-    let single_pass = WhisperOptions {
-        initial_prompt: args.initial_prompt.unwrap_or_default(),
-        hotwords: args.hotwords.unwrap_or_default(),
+    let single_pass = WhisperConditioning {
+        initial_prompt: args.initial_prompt.as_deref(),
+        hotwords: args.hotwords.as_deref(),
         ..Default::default()
     };
-    let single_pass_text =
-        transcript(&whisper.generate_segments(&samples, language, &single_pass)?);
+    let single_pass_text = transcript(&whisper.generate_segments_conditioned(
+        &samples,
+        language,
+        &options,
+        &single_pass,
+    )?);
 
-    let reconciled = WhisperOptions {
+    let reconciled = WhisperConditioning {
         reconcile_conditioning: true,
         ..single_pass
     };
-    let reconciled_text =
-        transcript(&whisper.generate_segments(&samples, language, &reconciled)?);
+    let reconciled_text = transcript(&whisper.generate_segments_conditioned(
+        &samples,
+        language,
+        &options,
+        &reconciled,
+    )?);
 
     println!("--- WITHOUT conditioning ---\n{baseline_text}\n");
     println!("--- SINGLE-PASS conditioning ---\n{single_pass_text}\n");

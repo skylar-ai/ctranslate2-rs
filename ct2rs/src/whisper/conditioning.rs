@@ -1,11 +1,12 @@
-//! `initial_prompt`/`hotwords` conditioning for [`super::Whisper::generate_segments`].
+//! `initial_prompt`/`hotwords` conditioning for [`super::Whisper::generate_segments_conditioned`]
+//! and [`super::Whisper::generate_conditioned`].
 //!
 //! Builds the `<|startofprev|>`-prefixed prompt tokens for `initial_prompt`/`hotwords`, mirroring
 //! faster-whisper's `get_prompt` token order but applied identically to every chunk (no rolling
 //! previous-text conditioning), and capped so the conditioned decode keeps the same output budget
 //! as the plain one (see [`conditioning_token_budget`]). By default each conditioned chunk is
-//! decoded once with that prompt. With `WhisperOptions::reconcile_conditioning` set, each chunk is
-//! instead decoded twice — once with the plain prompt, once with the conditioned one — and the
+//! decoded once with that prompt. With `WhisperConditioning::reconcile_conditioning` set,
+//! [`super::Whisper::generate_segments_conditioned`] instead decodes each chunk twice — once with the plain prompt, once with the conditioned one — and the
 //! two transcripts are reconciled word by word via
 //! [`reconciliation::merge_word_hypotheses`][super::reconciliation::merge_word_hypotheses], so
 //! conditioning can bias wording but never silently drop content.
@@ -16,7 +17,7 @@ use super::reconciliation::{
     copied_from_prompt_ratio, is_monotonic, join_words, merge_word_hypotheses,
 };
 use super::{group_tokens_into_words, process_word_timings};
-use super::{sys, Segment, Tokenizer, Whisper, WhisperOptions, Word};
+use super::{sys, Segment, Tokenizer, Whisper, WhisperConditioning, WhisperOptions, Word};
 
 /// Above this fraction of conditioned words copied from the prompt (see
 /// [`copied_from_prompt_ratio`]), the conditioned decode is treated as having stopped following
@@ -176,24 +177,26 @@ impl Whisper {
         Ok((final_words, spaces))
     }
 
-    /// Builds the `<|startofprev|>`-prefixed conditioning tokens for `options.hotwords`/
-    /// `options.initial_prompt`, mirroring faster-whisper's `get_prompt` token order, but applied
-    /// identically to every chunk (no rolling previous-text conditioning). At most
-    /// [`conditioning_token_budget`] content tokens are kept in total for a start-of-transcript
-    /// sequence `sot_len` tokens long (see [`fit_to_budget`]). Blank (empty/whitespace-only) text
+    /// Builds the `<|startofprev|>`-prefixed conditioning tokens for `conditioning.hotwords`/
+    /// `conditioning.initial_prompt`, mirroring faster-whisper's `get_prompt` token order, but
+    /// applied identically to every chunk (no rolling previous-text conditioning). At most
+    /// [`conditioning_token_budget`] content tokens are kept in total for a decoder context of
+    /// `max_length` and a start-of-transcript sequence `sot_len` tokens long (see
+    /// [`fit_to_budget`]). Blank (empty/whitespace-only) text
     /// counts as not provided. Returns an empty vector if neither is provided, in which case
     /// callers see no behavior change at all.
     pub(super) fn build_conditioning_prefix(
         &self,
-        options: &WhisperOptions,
+        conditioning: &WhisperConditioning,
+        max_length: usize,
         sot_len: usize,
     ) -> Result<Vec<String>> {
-        let initial_prompt = non_blank(&options.initial_prompt);
-        let hotwords = non_blank(&options.hotwords);
+        let initial_prompt = non_blank(conditioning.initial_prompt);
+        let hotwords = non_blank(conditioning.hotwords);
         if initial_prompt.is_none() && hotwords.is_none() {
             return Ok(Vec::new());
         }
-        let budget = conditioning_token_budget(options.max_length, sot_len);
+        let budget = conditioning_token_budget(max_length, sot_len);
 
         let hotwords_tokens = hotwords.map(|hw| self.encode_raw(hw)).transpose()?;
         let prompt_tokens = initial_prompt
@@ -255,8 +258,8 @@ impl Whisper {
 
 /// Treats empty/whitespace-only text as absent, so e.g. a blank form field or an empty proto3
 /// `string` can't trigger conditioning with no actual content.
-fn non_blank(text: &str) -> Option<&str> {
-    Some(text).filter(|t| !t.trim().is_empty())
+fn non_blank(text: Option<&str>) -> Option<&str> {
+    text.filter(|t| !t.trim().is_empty())
 }
 
 /// Whether a reconciled chunk falls back to its unconditioned transcript: when more than
@@ -308,9 +311,21 @@ mod tests {
 
     #[test]
     fn test_non_blank_treats_empty_and_whitespace_as_absent() {
-        assert_eq!(non_blank(""), None);
-        assert_eq!(non_blank(" \t\n"), None);
-        assert_eq!(non_blank(" Kubernetes "), Some(" Kubernetes "));
+        assert_eq!(non_blank(None), None);
+        assert_eq!(non_blank(Some("")), None);
+        assert_eq!(non_blank(Some(" \t\n")), None);
+        assert_eq!(non_blank(Some(" Kubernetes ")), Some(" Kubernetes "));
+    }
+
+    #[test]
+    fn test_whisper_conditioning_default_is_unset_and_copy() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<crate::WhisperConditioning>();
+
+        let conditioning = crate::WhisperConditioning::default();
+        assert_eq!(conditioning.initial_prompt, None);
+        assert_eq!(conditioning.hotwords, None);
+        assert!(!conditioning.reconcile_conditioning);
     }
 
     fn starting_at(starts: &[f32]) -> Vec<Word> {
