@@ -3,8 +3,9 @@
 //! Builds the `<|startofprev|>`-prefixed prompt tokens for `initial_prompt`/`hotwords`, mirroring
 //! faster-whisper's `get_prompt` token order but applied identically to every chunk (no rolling
 //! previous-text conditioning), and capped so the conditioned decode keeps the same output budget
-//! as the plain one (see [`conditioning_token_budget`]). When conditioning is requested, each
-//! chunk is decoded twice — once with the plain prompt, once with the conditioned one — and the
+//! as the plain one (see [`conditioning_token_budget`]). By default each conditioned chunk is
+//! decoded once with that prompt. With `WhisperOptions::reconcile_conditioning` set, each chunk is
+//! instead decoded twice — once with the plain prompt, once with the conditioned one — and the
 //! two transcripts are reconciled word by word via
 //! [`reconciliation::merge_word_hypotheses`][super::reconciliation::merge_word_hypotheses], so
 //! conditioning can bias wording but never silently drop content.
@@ -14,7 +15,7 @@ use anyhow::{anyhow, Result};
 use super::reconciliation::{
     copied_from_prompt_ratio, is_monotonic, join_words, merge_word_hypotheses,
 };
-use super::{group_tokens_into_words, is_special_token, process_word_timings};
+use super::{group_tokens_into_words, process_word_timings};
 use super::{sys, Segment, Tokenizer, Whisper, WhisperOptions, Word};
 
 /// Above this fraction of conditioned words copied from the prompt (see
@@ -29,59 +30,6 @@ const MAX_COPIED_FROM_PROMPT_RATIO: f32 = 0.25;
 const MAX_BACKWARD_JUMP_SECS: f32 = 1.0;
 
 impl Whisper {
-    /// Decodes and aligns a single prompt for every chunk, with no conditioning involved. This is
-    /// the path used whenever `initial_prompt`/`hotwords` are both blank.
-    pub(super) fn generate_segments_plain(
-        &self,
-        encoder_output: &sys::StorageView,
-        prompt: &[String],
-        num_chunks: usize,
-        options: &WhisperOptions,
-    ) -> Result<Vec<Segment>> {
-        let gen_results =
-            self.whisper
-                .generate(encoder_output, &vec![prompt.to_vec(); num_chunks], options)?;
-        let alignment_results =
-            self.align_chunks(encoder_output, prompt, &gen_results, num_chunks)?;
-
-        let mut segments = Vec::with_capacity(num_chunks);
-        for (chunk_idx, (res, align_res)) in
-            gen_results.iter().zip(alignment_results.iter()).enumerate()
-        {
-            let chunk_offset =
-                (chunk_idx * self.config.n_samples) as f32 / self.config.sampling_rate as f32;
-            let tokens = &res.sequences[0];
-
-            // `tokens` (`res.sequences[0]`) never echoes back the forced prompt beyond its
-            // single trailing task token (`<|transcribe|>`/`<|notimestamps|>`). CTranslate2
-            // feeds everything before that purely through the decoder's KV cache and only
-            // returns the newly generated continuation (see `WhisperReplica::generate` in
-            // `CTranslate2/src/models/whisper.cc`). That leading task token is filtered out
-            // below like any other special token.
-            let (words, _) = self.words_from_tokens(tokens, align_res, chunk_offset)?;
-
-            let clean_tokens: Vec<String> = tokens
-                .iter()
-                .filter(|t| !is_special_token(t))
-                .cloned()
-                .collect();
-            let chunk_text = self.tokenizer.decode(clean_tokens)?.trim().to_string();
-
-            let seg_start = words.first().map(|w| w.start).unwrap_or(chunk_offset);
-            let seg_end = words.last().map(|w| w.end).unwrap_or(chunk_offset);
-
-            segments.push(Segment {
-                id: chunk_idx,
-                text: chunk_text,
-                start: seg_start,
-                end: seg_end,
-                words: Some(words),
-            });
-        }
-
-        Ok(segments)
-    }
-
     /// Decodes every chunk with both the conditioned and the plain prompt, then reconciles the
     /// two transcripts word by word instead of picking one whole chunk as the winner.
     ///
@@ -100,8 +48,8 @@ impl Whisper {
     /// or when the merged words go back in time because the two alignments disagree. A copying
     /// decoder is very confident, so word-level confidence alone can't catch it.
     ///
-    /// Cost: roughly 2x decode and 2x alignment work for chunks that use conditioning (nothing
-    /// extra when `initial_prompt`/`hotwords` aren't set, since this path isn't taken then).
+    /// Cost: roughly 2x decode and 2x alignment work for chunks that use conditioning. Only taken
+    /// when `reconcile_conditioning` is set and `initial_prompt`/`hotwords` aren't both blank.
     pub(super) fn generate_segments_with_conditioning(
         &self,
         encoder_output: &sys::StorageView,
@@ -169,9 +117,7 @@ impl Whisper {
                 .iter()
                 .map(|pick| pick.word(&base_words, &cond_words))
                 .collect();
-            let (words, spaces) = if copied_ratio > MAX_COPIED_FROM_PROMPT_RATIO
-                || !is_monotonic(&merged, MAX_BACKWARD_JUMP_SECS)
-            {
+            let (words, spaces) = if keeps_unconditioned(copied_ratio, &merged) {
                 (base_words, base_spaces)
             } else {
                 let spaces = picks
@@ -200,7 +146,7 @@ impl Whisper {
     /// tokens and matching DTW alignment, with punctuation attached to its neighbouring word (see
     /// [`group_tokens_into_words`]). Alongside each word, returns whether a space precedes it in
     /// the transcript, for [`join_words`].
-    fn words_from_tokens(
+    pub(super) fn words_from_tokens(
         &self,
         tokens: &[String],
         align_res: &sys::WhisperAlignmentResult,
@@ -280,7 +226,7 @@ impl Whisper {
     /// Runs DTW alignment for a batch of chunks that were all decoded from the same forced
     /// `prompt` (`align()` applies one shared `start_sequence` to its whole batch, so chunks
     /// decoded with different prompts must go through separate calls).
-    fn align_chunks(
+    pub(super) fn align_chunks(
         &self,
         encoder_output: &sys::StorageView,
         prompt: &[String],
@@ -311,6 +257,13 @@ impl Whisper {
 /// `string` can't trigger conditioning with no actual content.
 fn non_blank(text: &str) -> Option<&str> {
     Some(text).filter(|t| !t.trim().is_empty())
+}
+
+/// Whether a reconciled chunk falls back to its unconditioned transcript: when more than
+/// [`MAX_COPIED_FROM_PROMPT_RATIO`] of the conditioned words look copied from the prompt, or when
+/// the `merged` word starts go back by more than [`MAX_BACKWARD_JUMP_SECS`].
+fn keeps_unconditioned(copied_ratio: f32, merged: &[Word]) -> bool {
+    copied_ratio > MAX_COPIED_FROM_PROMPT_RATIO || !is_monotonic(merged, MAX_BACKWARD_JUMP_SECS)
 }
 
 /// Maximum number of `hotwords` + `initial_prompt` content tokens for a decode whose
@@ -358,6 +311,38 @@ mod tests {
         assert_eq!(non_blank(""), None);
         assert_eq!(non_blank(" \t\n"), None);
         assert_eq!(non_blank(" Kubernetes "), Some(" Kubernetes "));
+    }
+
+    fn starting_at(starts: &[f32]) -> Vec<Word> {
+        starts
+            .iter()
+            .map(|&start| Word {
+                word: "word".to_string(),
+                start,
+                end: start + 0.1,
+                probability: 0.9,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_keeps_unconditioned_on_prompt_copy_or_backward_jump() {
+        let in_order = starting_at(&[1.0, 2.0, 3.0]);
+        assert!(!keeps_unconditioned(0.0, &in_order));
+        assert!(
+            !keeps_unconditioned(0.25, &in_order),
+            "25% copied is tolerated"
+        );
+        assert!(keeps_unconditioned(0.26, &in_order), "over 25% copied");
+
+        assert!(
+            !keeps_unconditioned(0.0, &starting_at(&[5.0, 4.0])),
+            "1 s back"
+        );
+        assert!(
+            keeps_unconditioned(0.0, &starting_at(&[5.0, 3.5])),
+            "1.5 s back"
+        );
     }
 
     fn tokens(prefix: &str, n: usize) -> Vec<String> {

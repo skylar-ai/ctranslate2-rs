@@ -32,6 +32,8 @@ scripts/lessons.py
 
 # Ignore test assets
 **/tests/assets/*.wav
+# faster-whisper's hotwords fixture, converted to WAV (see ct2rs/tests/assets/README.md)
+!ct2rs/tests/assets/hotwords.wav
 
 # Ignore lock files
 pixi.lock

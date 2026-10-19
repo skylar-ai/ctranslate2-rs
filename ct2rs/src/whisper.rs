@@ -166,13 +166,15 @@ impl Whisper {
     /// * `language` - An optional language setting. It generates segments assuming the specified language.
     ///   If `None`, it uses Whisper's language detection.
     /// * `options` - Settings. When [`initial_prompt`][WhisperOptions::initial_prompt] and
-    ///   [`hotwords`][WhisperOptions::hotwords] are both blank, each chunk is decoded once. When
-    ///   either is set, each chunk is decoded twice (with and without conditioning) and the two
-    ///   transcripts are reconciled word by word: a conditioned word is kept only where it's more
-    ///   confident than the baseline, and content conditioning drops entirely is never accepted,
-    ///   at roughly 2x the decode and alignment cost for those chunks. A chunk whose conditioned
-    ///   decode copies the prompt instead of transcribing the audio, or whose merged word timings
-    ///   go backwards, keeps the baseline transcript.
+    ///   [`hotwords`][WhisperOptions::hotwords] are both blank, each chunk is decoded once with
+    ///   the plain prompt. When either is set, each chunk is decoded once with the conditioned
+    ///   prompt and its words are aligned against the plain start-of-transcript sequence, as
+    ///   faster-whisper's batched pipeline does; the transcript may omit, copy from the prompt, or
+    ///   translate content. With
+    ///   [`reconcile_conditioning`][WhisperOptions::reconcile_conditioning] set, each conditioned
+    ///   chunk is instead decoded twice (with and without conditioning) and the two transcripts
+    ///   are reconciled word by word, keeping every word of the unconditioned transcript at
+    ///   roughly 2x the decode and alignment cost.
     ///
     /// # Returns
     /// Returns a `Result` containing a vector of transcribed `Segment`s if successful,
@@ -200,15 +202,19 @@ impl Whisper {
         // Pass features through the encoder network to get encoder outputs
         let encoder_output = self.whisper.encode(&storage_view, false)?;
 
-        let sot_sequence = self.generate_prompt(&lang_token, true);
-        let baseline_prompt: Vec<String> = sot_sequence.iter().map(|t| t.to_string()).collect();
+        // For alignment and timing, we do want timestamps
+        let sot_sequence: Vec<String> = self
+            .generate_prompt(&lang_token, true)
+            .into_iter()
+            .map(String::from)
+            .collect();
 
-        let conditioning_prefix = self.build_conditioning_prefix(options, baseline_prompt.len())?;
-
+        let conditioning_prefix = self.build_conditioning_prefix(options, sot_sequence.len())?;
         if conditioning_prefix.is_empty() {
-            return self.generate_segments_plain(
+            return self.generate_segments_once(
                 &encoder_output,
-                &baseline_prompt,
+                &sot_sequence,
+                &sot_sequence,
                 num_chunks,
                 options,
             );
@@ -216,16 +222,84 @@ impl Whisper {
 
         let conditioned_prompt: Vec<String> = conditioning_prefix
             .into_iter()
-            .chain(baseline_prompt.iter().cloned())
+            .chain(sot_sequence.iter().cloned())
             .collect();
 
-        self.generate_segments_with_conditioning(
-            &encoder_output,
-            &baseline_prompt,
-            &conditioned_prompt,
-            num_chunks,
-            options,
-        )
+        if options.reconcile_conditioning {
+            self.generate_segments_with_conditioning(
+                &encoder_output,
+                &sot_sequence,
+                &conditioned_prompt,
+                num_chunks,
+                options,
+            )
+        } else {
+            self.generate_segments_once(
+                &encoder_output,
+                &conditioned_prompt,
+                &sot_sequence,
+                num_chunks,
+                options,
+            )
+        }
+    }
+
+    /// Decodes every chunk once with `prompt` and aligns the result against `alignment_prompt`.
+    ///
+    /// Words are aligned against the plain start-of-transcript sequence even when `prompt` carries
+    /// a conditioning prefix, as faster-whisper's `find_alignment` does: the decoded tokens are
+    /// the same continuation of the same task token either way, and a long prefix would otherwise
+    /// eat into the decoder positions the alignment needs.
+    fn generate_segments_once(
+        &self,
+        encoder_output: &sys::StorageView,
+        prompt: &[String],
+        alignment_prompt: &[String],
+        num_chunks: usize,
+        options: &WhisperOptions,
+    ) -> Result<Vec<Segment>> {
+        let gen_results =
+            self.whisper
+                .generate(encoder_output, &vec![prompt.to_vec(); num_chunks], options)?;
+        let alignment_results =
+            self.align_chunks(encoder_output, alignment_prompt, &gen_results, num_chunks)?;
+
+        let mut segments = Vec::with_capacity(num_chunks);
+        for (chunk_idx, (res, align_res)) in
+            gen_results.iter().zip(alignment_results.iter()).enumerate()
+        {
+            let chunk_offset =
+                (chunk_idx * self.config.n_samples) as f32 / self.config.sampling_rate as f32;
+            let tokens = &res.sequences[0];
+
+            // `tokens` (`res.sequences[0]`) never echoes back the forced prompt beyond its
+            // single trailing task token (`<|transcribe|>`/`<|notimestamps|>`). CTranslate2
+            // feeds everything before that purely through the decoder's KV cache and only
+            // returns the newly generated continuation (see `WhisperReplica::generate` in
+            // `CTranslate2/src/models/whisper.cc`). That leading task token is filtered out
+            // below like any other special token.
+            let (words, _) = self.words_from_tokens(tokens, align_res, chunk_offset)?;
+
+            let clean_tokens: Vec<String> = tokens
+                .iter()
+                .filter(|t| !is_special_token(t))
+                .cloned()
+                .collect();
+            let chunk_text = self.tokenizer.decode(clean_tokens)?.trim().to_string();
+
+            let seg_start = words.first().map(|w| w.start).unwrap_or(chunk_offset);
+            let seg_end = words.last().map(|w| w.end).unwrap_or(chunk_offset);
+
+            segments.push(Segment {
+                id: chunk_idx,
+                text: chunk_text,
+                start: seg_start,
+                end: seg_end,
+                words: Some(words),
+            });
+        }
+
+        Ok(segments)
     }
 
     /// Returns the expected sampling rate.
@@ -1158,6 +1232,18 @@ mod tests {
         };
         let conditioned = w.generate_segments(&samples, Some("en"), &blank).unwrap();
         assert_eq!(conditioned, plain, "blank conditioning changed the output");
+
+        let blank_reconciled = super::WhisperOptions {
+            reconcile_conditioning: true,
+            ..blank
+        };
+        let reconciled = w
+            .generate_segments(&samples, Some("en"), &blank_reconciled)
+            .unwrap();
+        assert_eq!(
+            reconciled, plain,
+            "reconcile_conditioning with blank conditioning changed the output"
+        );
     }
 
     /// Set conditioning must actually reach the decoder prompt: `<|startofprev|>`, then the
@@ -1210,6 +1296,8 @@ mod tests {
         let w = load_test_model();
         let long_prompt = "A recording used for telephone audio quality testing. ".repeat(200);
         let long_hotwords = "OSR, telephone, harvard sentences, ".repeat(200);
+        assert!(bpe_pieces(&w, &long_prompt).len() > 218);
+        assert!(bpe_pieces(&w, &long_hotwords).len() > 218);
 
         for (initial_prompt, hotwords) in [
             (long_prompt.as_str(), ""),
@@ -1219,14 +1307,18 @@ mod tests {
             let options = super::WhisperOptions {
                 initial_prompt: initial_prompt.to_string(),
                 hotwords: hotwords.to_string(),
+                reconcile_conditioning: false,
                 ..Default::default()
             };
+            assert_eq!(options.max_length, 448);
             let prefix = w.build_conditioning_prefix(&options, 3).unwrap();
             assert!(prefix.len() + 3 <= options.max_length / 2 - 2);
 
             for samples in [vec![0.0f32; w.n_samples()], load_test_audio(&w)] {
-                w.generate_segments(&samples, Some("en"), &options)
+                let segments = w
+                    .generate_segments(&samples, Some("en"), &options)
                     .unwrap_or_else(|e| panic!("oversized conditioning failed: {e:#}"));
+                assert!(!segments.is_empty());
             }
         }
     }
@@ -1275,6 +1367,201 @@ mod tests {
         };
         let segments = w.generate_segments(&samples, Some("en"), &options).unwrap();
         assert_punctuation_attached(&segments);
+    }
+
+    const CONDITIONED_PROMPT: &str = "A recording used for telephone audio quality testing.";
+    const CONDITIONED_HOTWORDS: &str = "OSR";
+
+    fn conditioned_options(reconcile_conditioning: bool) -> super::WhisperOptions {
+        super::WhisperOptions {
+            initial_prompt: CONDITIONED_PROMPT.to_string(),
+            hotwords: CONDITIONED_HOTWORDS.to_string(),
+            reconcile_conditioning,
+            ..Default::default()
+        }
+    }
+
+    /// Runs the encoder over `samples`, returning its output and the number of chunks.
+    fn encode_samples(w: &Whisper, samples: &[f32]) -> (crate::sys::StorageView<'static>, usize) {
+        let (mut mel, num_chunks) = w.generate_mel_spectrogram(samples).unwrap();
+        let shape = mel.shape().to_vec();
+        let features =
+            crate::sys::StorageView::new(&shape, mel.as_slice_mut().unwrap(), Default::default())
+                .unwrap();
+        (w.whisper.encode(&features, false).unwrap(), num_chunks)
+    }
+
+    /// Raw BPE pieces of `" " + text`, the way faster-whisper encodes prompt text.
+    fn bpe_pieces(w: &Whisper, text: &str) -> Vec<String> {
+        (*w.tokenizer)
+            .encode(format!(" {text}").as_str(), false)
+            .unwrap()
+            .get_tokens()
+            .to_vec()
+    }
+
+    fn plain_sot() -> Vec<String> {
+        ["<|startoftranscript|>", "<|en|>", "<|transcribe|>"]
+            .map(String::from)
+            .to_vec()
+    }
+
+    /// `<|startofprev|>`, hotword tokens, initial-prompt tokens, then the plain sot sequence.
+    fn conditioned_prompt(w: &Whisper) -> Vec<String> {
+        let mut prompt = vec!["<|startofprev|>".to_string()];
+        prompt.extend(bpe_pieces(w, CONDITIONED_HOTWORDS));
+        prompt.extend(bpe_pieces(w, CONDITIONED_PROMPT));
+        prompt.extend(plain_sot());
+        prompt
+    }
+
+    /// Whether this backend reproduces its own `generate_segments` output for identical calls.
+    fn is_deterministic(w: &Whisper, samples: &[f32], options: &super::WhisperOptions) -> bool {
+        let first = w.generate_segments(samples, Some("en"), options).unwrap();
+        if w.generate_segments(samples, Some("en"), options).unwrap() != first {
+            eprintln!("skipping: this backend's output differs between identical calls");
+            return false;
+        }
+        true
+    }
+
+    /// faster-whisper's `test_hotwords`, on its own `hotwords.mp3` converted to 16 kHz mono WAV.
+    #[test]
+    fn test_whisper_hotwords_single_pass_finds_comfyui() {
+        let w = load_test_model();
+        let samples = read_audio("tests/assets/hotwords.wav", w.sampling_rate()).unwrap();
+        let options = super::WhisperOptions {
+            hotwords: "ComfyUI".to_string(),
+            reconcile_conditioning: false,
+            ..Default::default()
+        };
+        let segments = w.generate_segments(&samples, None, &options).unwrap();
+        assert!(
+            segments[0].text.contains("ComfyUI"),
+            "first segment: {:?}",
+            segments[0].text
+        );
+    }
+
+    /// Without `reconcile_conditioning`, a conditioned chunk's text is exactly what a single
+    /// decode with the conditioned prompt produces.
+    #[test]
+    fn test_whisper_single_pass_conditioning_is_one_decode() {
+        let w = load_test_model();
+        let samples = load_test_audio(&w);
+        let options = conditioned_options(false);
+        if !is_deterministic(&w, &samples, &options) {
+            return;
+        }
+
+        let segments = w.generate_segments(&samples, Some("en"), &options).unwrap();
+
+        let (encoder_output, num_chunks) = encode_samples(&w, &samples);
+        let decoded = w
+            .whisper
+            .generate(
+                &encoder_output,
+                &vec![conditioned_prompt(&w); num_chunks],
+                &options,
+            )
+            .unwrap();
+        let expected: Vec<String> = decoded
+            .into_iter()
+            .map(|res| {
+                let text_tokens: Vec<String> = res.sequences[0]
+                    .iter()
+                    .filter(|t| !super::is_special_token(t))
+                    .cloned()
+                    .collect();
+                w.tokenizer.decode(text_tokens).unwrap().trim().to_string()
+            })
+            .collect();
+
+        let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, expected);
+    }
+
+    /// Without `reconcile_conditioning`, word timings and probabilities come from aligning the
+    /// conditioned decode against the plain start-of-transcript sequence, as faster-whisper does.
+    #[test]
+    fn test_whisper_single_pass_conditioning_aligns_against_plain_sot() {
+        let w = load_test_model();
+        let samples = load_test_audio(&w);
+        let options = conditioned_options(false);
+        if !is_deterministic(&w, &samples, &options) {
+            return;
+        }
+
+        let segments = w.generate_segments(&samples, Some("en"), &options).unwrap();
+
+        let (encoder_output, num_chunks) = encode_samples(&w, &samples);
+        let prompt = conditioned_prompt(&w);
+        let decoded = w
+            .whisper
+            .generate(&encoder_output, &vec![prompt.clone(); num_chunks], &options)
+            .unwrap();
+        let words_aligned_against = |start_sequence: &[String]| -> Vec<Vec<super::Word>> {
+            let alignments = w
+                .align_chunks(&encoder_output, start_sequence, &decoded, num_chunks)
+                .unwrap();
+            decoded
+                .iter()
+                .zip(&alignments)
+                .enumerate()
+                .map(|(chunk_idx, (res, align_res))| {
+                    let offset = (chunk_idx * w.n_samples()) as f32 / w.sampling_rate() as f32;
+                    w.words_from_tokens(&res.sequences[0], align_res, offset)
+                        .unwrap()
+                        .0
+                })
+                .collect()
+        };
+
+        let words: Vec<Vec<super::Word>> = segments
+            .iter()
+            .map(|s| s.words.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(words, words_aligned_against(&plain_sot()));
+        assert_ne!(
+            words,
+            words_aligned_against(&prompt),
+            "aligning against the conditioned prompt must give other timings, or this test can't \
+             tell the two apart"
+        );
+    }
+
+    /// With `reconcile_conditioning`, conditioned segments are ADR 001's two-pass reconciliation.
+    /// The expected text was recorded from that implementation before single-pass conditioning
+    /// existed, on the CPU `ruy` backend; other backends may legitimately transcribe differently,
+    /// so they skip.
+    #[test]
+    fn test_whisper_reconciled_conditioning_matches_adr_001() {
+        if !cfg!(feature = "ruy") || cfg!(feature = "cuda") {
+            eprintln!("skipping: expected text was recorded on the CPU ruy backend");
+            return;
+        }
+        let w = load_test_model();
+        let samples = load_test_audio(&w);
+        let segments = w
+            .generate_segments(&samples, Some("en"), &conditioned_options(true))
+            .unwrap();
+        let texts: Vec<&str> = segments.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "The birch can use lid on the smooth planks. Glue the sheet to the dark blue \
+                 background. It is easy to tell the depth of a well. These days, the chicken leg \
+                 is a rare dish. Rice is also served in round bowls. The juice of lemon makes fine \
+                 punch. The box was thrown beside the pork chuck. The hogs are fed chopped corn \
+                 and garbage.",
+                "A large size and stockings is hard to sell.",
+            ]
+        );
+        let word_counts: Vec<usize> = segments
+            .iter()
+            .map(|s| s.words.as_ref().map_or(0, Vec::len))
+            .collect();
+        assert_eq!(word_counts, vec![66, 9]);
     }
 
     /// Attaching punctuation to words must not change the unconditioned `Segment.text`, which is
