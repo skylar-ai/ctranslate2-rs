@@ -9,6 +9,8 @@ env:
 
 jobs:
   release:
+    # crates.io's ct2rs belongs to upstream; forks publish to their own registries.
+    if: github.repository == 'jkawamoto/ctranslate2-rs'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
