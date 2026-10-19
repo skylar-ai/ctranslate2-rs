@@ -5,6 +5,13 @@
 - **Deciders**: Lucas Silveira
 - **Tags**: whisper, decoding, performance, api
 
+> **2026-10-19:** `initial_prompt`, `hotwords` and `reconcile_conditioning` live on
+> `WhisperConditioning`, passed per call to `Whisper::generate_segments_conditioned` and
+> `Whisper::generate_conditioned`, and `WhisperOptions` keeps its `0.10.1-skylar-3` fields. Read
+> `WhisperOptions::reconcile_conditioning` below as `WhisperConditioning::reconcile_conditioning`,
+> read only by `Whisper::generate_segments_conditioned`; `Whisper::generate_conditioned` ignores it
+> and decodes each chunk once. The decision below is otherwise unchanged.
+
 ## Context and Problem Statement
 
 `WhisperOptions::initial_prompt` and `hotwords` had one implementation, the one

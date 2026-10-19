@@ -125,8 +125,8 @@ A conditioned decode can drop a clause or a whole sentence, copy the prompt
 into the transcript, or switch language. faster-whisper uses the conditioned
 decode as-is in both pipelines.
 
-`generate_segments` has two modes, selected by
-`WhisperOptions::reconcile_conditioning`:
+`generate_segments_conditioned` has two modes, selected by
+`WhisperConditioning::reconcile_conditioning`:
 
 - **Single-pass** (`false`, the default) matches faster-whisper: each
   conditioned chunk is decoded once and that transcript is used as-is, so it
@@ -148,6 +148,9 @@ transcripts word by word, as described in
 This costs about twice the decode and alignment work for conditioned chunks.
 It doesn't protect against a hotword that replaces a real word with higher
 confidence, or against a short insertion.
+
+`generate_conditioned`, the conditioned `generate`, has no word alignment to
+reconcile, so it ignores `reconcile_conditioning` and is always single-pass.
 
 ## Word alignment
 

@@ -128,9 +128,11 @@ for more information.
 
 ## Whisper Prompt Conditioning
 
-`Whisper::generate_segments` reads the `initial_prompt` and `hotwords` fields of `WhisperOptions` (empty by default)
-to bias transcription toward known vocabulary, such as proper nouns or domain-specific
-terms the model would otherwise misspell. The `reconcile_conditioning` field of `WhisperOptions` selects one of two modes:
+`Whisper::generate_segments_conditioned` and `Whisper::generate_conditioned` take a `WhisperConditioning`
+whose `initial_prompt` and `hotwords` (unset by default) bias transcription toward known vocabulary,
+such as proper nouns or domain-specific terms the model would otherwise misspell. With neither set, they behave
+exactly like `generate_segments` and `generate`. For `generate_segments_conditioned`, the `reconcile_conditioning`
+field of `WhisperConditioning` selects one of two modes:
 
 - **Single-pass** (`reconcile_conditioning = false`, the default): each conditioned chunk is decoded once,
   as faster-whisper's batched pipeline does. The transcript may omit, copy from the prompt, or translate content
@@ -138,6 +140,17 @@ terms the model would otherwise misspell. The `reconcile_conditioning` field of 
 - **Reconciled** (`reconcile_conditioning = true`): each conditioned chunk is decoded with and without conditioning,
   and the two transcripts are merged word by word, so no word of the unconditioned transcript is lost.
   This costs about twice the decode and alignment work.
+
+`generate_conditioned` returns no word timings to reconcile, so it ignores `reconcile_conditioning` and is always
+single-pass.
+
+```rust
+let conditioning = WhisperConditioning {
+    hotwords: Some("Kubernetes"),
+    ..Default::default()
+};
+let segments = whisper.generate_segments_conditioned(&samples, Some("en"), &options, &conditioning)?;
+```
 
 Please refer to the [example code](ct2rs/examples/whisper_hotwords.rs), which prints both modes side by side,
 for more information. [ADR-003](ct2rs/docs/adr/003-single-pass-whisper-conditioning-by-default.md) records why
