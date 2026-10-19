@@ -764,7 +764,8 @@ mod tests_grouping {
         for (punctuation, expected) in [
             (";", "wait;"),
             ("...", "wait..."),
-            ("…", "wait…"),
+            // Space-marked, so the splitter makes it a piece of its own and the merge must act.
+            ("Ġ…", "wait…"),
             ("Ġ—", "wait—"),
         ] {
             assert_eq!(texts(&group(&["Ġwait", punctuation])), vec![expected]);

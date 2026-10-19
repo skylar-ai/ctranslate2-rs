@@ -316,7 +316,9 @@ mod tests {
             ]
         );
 
-        let base_spaces = [true, true, true, true];
+        // The sides disagree at every matched position, so a matched word visibly takes `cond`'s
+        // flag, the side its spelling comes from.
+        let base_spaces = [false, true, false, true];
         let cond_spaces = [true, false, true];
         let spaces: Vec<bool> = picks
             .iter()
@@ -454,8 +456,7 @@ mod tests {
             ("tradução", 0.9),
             ("simultânea", 0.9),
             ("e", 0.9),
-            ("silagem", 0.99),
-            (".", 0.99),
+            ("silagem.", 0.99),
             ("Programa", 0.99),
             ("agrícola", 0.99),
             ("sobre", 0.99),
@@ -483,11 +484,10 @@ mod tests {
 
     #[test]
     fn test_join_words_skips_space_before_punctuation() {
-        let ws = words(&[("Hello", 0.9), (",", 0.9), ("world", 0.9), ("!", 0.9)]);
-        assert_eq!(
-            join_words(&ws, &[true, false, true, false]),
-            "Hello, world!"
-        );
+        // Punctuation-only words only survive grouping in a run with no word to attach to, e.g.
+        // `...` right after a timestamp; they still attach without a space.
+        let ws = words(&[("Hello,", 0.9), ("...", 0.9), ("!", 0.9)]);
+        assert_eq!(join_words(&ws, &[true, false, false]), "Hello,...!");
     }
 
     #[test]

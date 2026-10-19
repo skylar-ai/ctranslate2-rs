@@ -24,8 +24,8 @@ const MAX_COPIED_FROM_PROMPT_RATIO: f32 = 0.25;
 
 /// How far back (in seconds) a merged word may start relative to the previous one before the
 /// merge is rejected as mixing two disagreeing alignments. Words kept from different passes can
-/// be a few hundred milliseconds out of order (e.g. a conditioned filler word next to baseline
-/// punctuation); a derailed pass is off by several seconds.
+/// be a few hundred milliseconds out of order (e.g. a conditioned filler word inserted next to a
+/// baseline word); a derailed pass is off by several seconds.
 const MAX_BACKWARD_JUMP_SECS: f32 = 1.0;
 
 impl Whisper {
