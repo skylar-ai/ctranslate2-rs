@@ -3,7 +3,10 @@
 This page compares `ct2rs::Whisper::generate_segments` with the transcription
 pipelines in [faster-whisper](https://github.com/SYSTRAN/faster-whisper). Use it
 when you port code from faster-whisper, compare transcripts between the two, or
-decide which faster-whisper behavior to bring into this crate.
+decide which faster-whisper behavior to bring into this crate. Conditioning
+(`initial_prompt`, `hotwords`, `reconcile_conditioning`) is passed as a
+`WhisperConditioning` to `generate_segments_conditioned`; with none set, it
+behaves exactly like `generate_segments`.
 
 The comparison uses faster-whisper's
 [`faster_whisper/transcribe.py` at commit `9e472ae`](https://github.com/SYSTRAN/faster-whisper/blob/9e472ae9de8bb374552f531f752654554b76b2d6/faster_whisper/transcribe.py),
@@ -134,7 +137,7 @@ decode as-is in both pipelines.
   [ADR 003](adr/003-single-pass-whisper-conditioning-by-default.md).
 - **Reconciled** (`true`) is described below.
 
-With `reconcile_conditioning = true`, `generate_segments` decodes each
+With `reconcile_conditioning = true`, `generate_segments_conditioned` decodes each
 conditioned chunk twice, with and without conditioning, and merges the two
 transcripts word by word, as described in
 [ADR 001](adr/001-word-level-reconciliation-for-whisper-conditioning.md):
@@ -158,7 +161,7 @@ Both implementations run CTranslate2's dynamic time warping (DTW) alignment on
 cross-attention weights with a median filter width of 7. They differ in what
 they pass to it:
 
-- **Start sequence:** by default, `generate_segments` passes the plain
+- **Start sequence:** by default, `generate_segments_conditioned` passes the plain
   start-of-transcript sequence, as faster-whisper always does, so a long
   conditioning prefix never reduces the room left for alignment. With
   `reconcile_conditioning = true`, it aligns each of the two decodes against
