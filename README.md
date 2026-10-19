@@ -130,10 +130,19 @@ for more information.
 
 `Whisper::generate_segments` reads the `initial_prompt` and `hotwords` fields of `WhisperOptions` (empty by default)
 to bias transcription toward known vocabulary, such as proper nouns or domain-specific
-terms the model would otherwise misspell.
-Please refer to the [example code](ct2rs/examples/whisper_hotwords.rs)
-for more information, or [ADR-001](ct2rs/docs/adr/001-word-level-reconciliation-for-whisper-conditioning.md)
-for the design rationale.
+terms the model would otherwise misspell. The `reconcile_conditioning` field of `WhisperOptions` selects one of two modes:
+
+- **Single-pass** (`reconcile_conditioning = false`, the default): each conditioned chunk is decoded once,
+  as faster-whisper's batched pipeline does. The transcript may omit, copy from the prompt, or translate content
+  the unconditioned transcript had.
+- **Reconciled** (`reconcile_conditioning = true`): each conditioned chunk is decoded with and without conditioning,
+  and the two transcripts are merged word by word, so no word of the unconditioned transcript is lost.
+  This costs about twice the decode and alignment work.
+
+Please refer to the [example code](ct2rs/examples/whisper_hotwords.rs), which prints both modes side by side,
+for more information. [ADR-003](ct2rs/docs/adr/003-single-pass-whisper-conditioning-by-default.md) records why
+single-pass is the default, and [ADR-001](ct2rs/docs/adr/001-word-level-reconciliation-for-whisper-conditioning.md)
+records how reconciliation works.
 
 ## Model Conversion for CTranslate2
 

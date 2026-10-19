@@ -8,6 +8,12 @@
 > **2026-10-19:** `WhisperConditioning` and `Whisper::generate_segments_conditioned` were removed.
 > `initial_prompt` and `hotwords` are now `String` fields on `WhisperOptions` (empty = unset), read by
 > `Whisper::generate_segments`. The reconciliation decided here is unchanged.
+>
+> **2026-10-19:** The reconciliation decided here now runs only when
+> `WhisperOptions::reconcile_conditioning` is `true`. By default each conditioned chunk is decoded
+> once and used as-is, as recorded in
+> [ADR-003](003-single-pass-whisper-conditioning-by-default.md). The decision below is unchanged for
+> the opt-in mode.
 
 ## Context and Problem Statement
 
