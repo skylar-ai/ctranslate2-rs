@@ -126,6 +126,37 @@ This crate also offers a streaming API that utilizes callback closures.
 Please refer to the [example code](ct2rs/examples/stream.rs)
 for more information.
 
+## Whisper Prompt Conditioning
+
+`Whisper::generate_segments_conditioned` and `Whisper::generate_conditioned` take a `WhisperConditioning`
+whose `initial_prompt` and `hotwords` (unset by default) bias transcription toward known vocabulary,
+such as proper nouns or domain-specific terms the model would otherwise misspell. With neither set, they behave
+exactly like `generate_segments` and `generate`. For `generate_segments_conditioned`, the `reconcile_conditioning`
+field of `WhisperConditioning` selects one of two modes:
+
+- **Single-pass** (`reconcile_conditioning = false`, the default): each conditioned chunk is decoded once,
+  as faster-whisper's batched pipeline does. The transcript may omit, copy from the prompt, or translate content
+  the unconditioned transcript had.
+- **Reconciled** (`reconcile_conditioning = true`): each conditioned chunk is decoded with and without conditioning,
+  and the two transcripts are merged word by word, so no word of the unconditioned transcript is lost.
+  This costs about twice the decode and alignment work.
+
+`generate_conditioned` returns no word timings to reconcile, so it ignores `reconcile_conditioning` and is always
+single-pass.
+
+```rust
+let conditioning = WhisperConditioning {
+    hotwords: Some("Kubernetes"),
+    ..Default::default()
+};
+let segments = whisper.generate_segments_conditioned(&samples, Some("en"), &options, &conditioning)?;
+```
+
+Please refer to the [example code](ct2rs/examples/whisper_hotwords.rs), which prints both modes side by side,
+for more information. [ADR-003](ct2rs/docs/adr/003-single-pass-whisper-conditioning-by-default.md) records why
+single-pass is the default, and [ADR-001](ct2rs/docs/adr/001-word-level-reconciliation-for-whisper-conditioning.md)
+records how reconciliation works.
+
 ## Model Conversion for CTranslate2
 
 To use model files with CTranslate2, they must first be converted.

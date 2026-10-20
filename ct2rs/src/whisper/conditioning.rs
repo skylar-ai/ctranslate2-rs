@@ -1,0 +1,411 @@
+//! `initial_prompt`/`hotwords` conditioning for [`super::Whisper::generate_segments_conditioned`]
+//! and [`super::Whisper::generate_conditioned`].
+//!
+//! Builds the `<|startofprev|>`-prefixed prompt tokens for `initial_prompt`/`hotwords`, mirroring
+//! faster-whisper's `get_prompt` token order but applied identically to every chunk (no rolling
+//! previous-text conditioning), and capped so the conditioned decode keeps the same output budget
+//! as the plain one (see [`conditioning_token_budget`]). By default each conditioned chunk is
+//! decoded once with that prompt. With `WhisperConditioning::reconcile_conditioning` set,
+//! [`super::Whisper::generate_segments_conditioned`] instead decodes each chunk twice — once with the plain prompt, once with the conditioned one — and the
+//! two transcripts are reconciled word by word via
+//! [`reconciliation::merge_word_hypotheses`][super::reconciliation::merge_word_hypotheses], so
+//! conditioning can bias wording but never silently drop content.
+
+use anyhow::{anyhow, Result};
+
+use super::reconciliation::{
+    copied_from_prompt_ratio, is_monotonic, join_words, merge_word_hypotheses,
+};
+use super::{group_tokens_into_words, process_word_timings};
+use super::{sys, Segment, Tokenizer, Whisper, WhisperConditioning, WhisperOptions, Word};
+
+/// Above this fraction of conditioned words copied from the prompt (see
+/// [`copied_from_prompt_ratio`]), the conditioned decode is treated as having stopped following
+/// the audio, and the chunk keeps the baseline transcript.
+const MAX_COPIED_FROM_PROMPT_RATIO: f32 = 0.25;
+
+/// How far back (in seconds) a merged word may start relative to the previous one before the
+/// merge is rejected as mixing two disagreeing alignments. Words kept from different passes can
+/// be a few hundred milliseconds out of order (e.g. a conditioned filler word inserted next to a
+/// baseline word); a derailed pass is off by several seconds.
+const MAX_BACKWARD_JUMP_SECS: f32 = 1.0;
+
+impl Whisper {
+    /// Decodes every chunk with both the conditioned and the plain prompt, then reconciles the
+    /// two transcripts word by word instead of picking one whole chunk as the winner.
+    ///
+    /// Forced-prompt conditioning biases the whole decode trajectory, not just the target word,
+    /// so on real audio it can occasionally derail unrelated content elsewhere in the same chunk.
+    /// A whole-chunk "keep whichever scored better" comparison would still accept that collateral
+    /// damage as long as the rest of the chunk improved enough to raise its average score.
+    /// Reconciling word by word (see
+    /// [`reconciliation::merge_word_hypotheses`][super::reconciliation::merge_word_hypotheses])
+    /// avoids that: matching words are kept as-is, a word conditioning changed is kept only if
+    /// its local confidence improved, and content conditioning dropped entirely is never accepted
+    /// silently: the baseline's words are used for that span instead.
+    ///
+    /// A chunk keeps its baseline transcript unchanged when the conditioned decode stopped
+    /// following the audio and started copying the prompt (see [`copied_from_prompt_ratio`]),
+    /// or when the merged words go back in time because the two alignments disagree. A copying
+    /// decoder is very confident, so word-level confidence alone can't catch it.
+    ///
+    /// Cost: roughly 2x decode and 2x alignment work for chunks that use conditioning. Only taken
+    /// when `reconcile_conditioning` is set and `initial_prompt`/`hotwords` aren't both blank.
+    pub(super) fn generate_segments_with_conditioning(
+        &self,
+        encoder_output: &sys::StorageView,
+        baseline_prompt: &[String],
+        conditioned_prompt: &[String],
+        num_chunks: usize,
+        options: &WhisperOptions,
+    ) -> Result<Vec<Segment>> {
+        // These must be two separate `generate()` calls, not one batch of both prompt kinds:
+        // CTranslate2 requires every prompt within a single batch to have
+        // `<|startoftranscript|>` at the same index, which the conditioned prompt (longer,
+        // prefixed with the conditioning tokens) and the plain prompt (unprefixed) don't share.
+        let conditioned_results = self.whisper.generate(
+            encoder_output,
+            &vec![conditioned_prompt.to_vec(); num_chunks],
+            options,
+        )?;
+        let baseline_results = self.whisper.generate(
+            encoder_output,
+            &vec![baseline_prompt.to_vec(); num_chunks],
+            options,
+        )?;
+
+        // Each candidate is aligned with its own matching prompt, so word-level confidence
+        // (used by `merge_word_hypotheses` below) is measured fairly for both, not skewed by
+        // forcing one candidate's words through the other's decoder context.
+        let conditioned_alignments = self.align_chunks(
+            encoder_output,
+            conditioned_prompt,
+            &conditioned_results,
+            num_chunks,
+        )?;
+        let baseline_alignments = self.align_chunks(
+            encoder_output,
+            baseline_prompt,
+            &baseline_results,
+            num_chunks,
+        )?;
+
+        // The conditioning content sits between `<|startofprev|>` and the baseline sot sequence.
+        let conditioning_text = self.tokenizer.decode(
+            conditioned_prompt[1..conditioned_prompt.len() - baseline_prompt.len()].to_vec(),
+        )?;
+
+        let mut segments = Vec::with_capacity(num_chunks);
+        for chunk_idx in 0..num_chunks {
+            let chunk_offset =
+                (chunk_idx * self.config.n_samples) as f32 / self.config.sampling_rate as f32;
+
+            let (cond_words, cond_spaces) = self.words_from_tokens(
+                &conditioned_results[chunk_idx].sequences[0],
+                &conditioned_alignments[chunk_idx],
+                chunk_offset,
+            )?;
+            let (base_words, base_spaces) = self.words_from_tokens(
+                &baseline_results[chunk_idx].sequences[0],
+                &baseline_alignments[chunk_idx],
+                chunk_offset,
+            )?;
+
+            let copied_ratio =
+                copied_from_prompt_ratio(&base_words, &cond_words, &conditioning_text);
+            let picks = merge_word_hypotheses(&base_words, &cond_words);
+            let merged: Vec<Word> = picks
+                .iter()
+                .map(|pick| pick.word(&base_words, &cond_words))
+                .collect();
+            let (words, spaces) = if keeps_unconditioned(copied_ratio, &merged) {
+                (base_words, base_spaces)
+            } else {
+                let spaces = picks
+                    .iter()
+                    .map(|pick| pick.space_before(&base_spaces, &cond_spaces))
+                    .collect();
+                (merged, spaces)
+            };
+            let seg_start = words.first().map(|w| w.start).unwrap_or(chunk_offset);
+            let seg_end = words.last().map(|w| w.end).unwrap_or(chunk_offset);
+            let text = join_words(&words, &spaces);
+
+            segments.push(Segment {
+                id: chunk_idx,
+                text,
+                start: seg_start,
+                end: seg_end,
+                words: Some(words),
+            });
+        }
+
+        Ok(segments)
+    }
+
+    /// Extracts word-level text, timing and per-word confidence for one chunk from its decoded
+    /// tokens and matching DTW alignment, with punctuation attached to its neighbouring word (see
+    /// [`group_tokens_into_words`]). Alongside each word, returns whether a space precedes it in
+    /// the transcript, for [`join_words`].
+    pub(super) fn words_from_tokens(
+        &self,
+        tokens: &[String],
+        align_res: &sys::WhisperAlignmentResult,
+        chunk_offset: f32,
+    ) -> Result<(Vec<Word>, Vec<bool>)> {
+        let grouped = group_tokens_into_words(tokens, |t| self.tokenizer.decode(t.to_vec()))?;
+        let word_token_ranges: Vec<_> = grouped.iter().map(|w| w.range.clone()).collect();
+        let chunk_words = process_word_timings(
+            &word_token_ranges,
+            &align_res.alignments,
+            &align_res.text_token_probs,
+            tokens.len(),
+        );
+
+        let mut final_words = Vec::new();
+        let mut spaces = Vec::new();
+        for (grouped_word, mut word) in grouped.into_iter().zip(chunk_words) {
+            if grouped_word.text.is_empty() {
+                continue;
+            }
+            word.word = grouped_word.text;
+            word.start += chunk_offset;
+            word.end += chunk_offset;
+            final_words.push(word);
+            spaces.push(grouped_word.space_before);
+        }
+        Ok((final_words, spaces))
+    }
+
+    /// Builds the `<|startofprev|>`-prefixed conditioning tokens for `conditioning.hotwords`/
+    /// `conditioning.initial_prompt`, mirroring faster-whisper's `get_prompt` token order, but
+    /// applied identically to every chunk (no rolling previous-text conditioning). At most
+    /// [`conditioning_token_budget`] content tokens are kept in total for a decoder context of
+    /// `max_length` and a start-of-transcript sequence `sot_len` tokens long (see
+    /// [`fit_to_budget`]). Blank (empty/whitespace-only) text
+    /// counts as not provided. Returns an empty vector if neither is provided, in which case
+    /// callers see no behavior change at all.
+    pub(super) fn build_conditioning_prefix(
+        &self,
+        conditioning: &WhisperConditioning,
+        max_length: usize,
+        sot_len: usize,
+    ) -> Result<Vec<String>> {
+        let initial_prompt = non_blank(conditioning.initial_prompt);
+        let hotwords = non_blank(conditioning.hotwords);
+        if initial_prompt.is_none() && hotwords.is_none() {
+            return Ok(Vec::new());
+        }
+        let budget = conditioning_token_budget(max_length, sot_len);
+
+        let hotwords_tokens = hotwords.map(|hw| self.encode_raw(hw)).transpose()?;
+        let prompt_tokens = initial_prompt
+            .map(|prompt| self.encode_raw(prompt))
+            .transpose()?;
+        let (hotwords_tokens, prompt_tokens) = fit_to_budget(
+            hotwords_tokens.unwrap_or_default(),
+            prompt_tokens.unwrap_or_default(),
+            budget,
+        );
+
+        let mut prefix = vec!["<|startofprev|>".to_string()];
+        prefix.extend(hotwords_tokens);
+        prefix.extend(prompt_tokens);
+        Ok(prefix)
+    }
+
+    /// Encodes free text into raw BPE token piece strings, bypassing the wrapping
+    /// `hf::Tokenizer`'s special-token template (we only want the plain content pieces, not the
+    /// model's own start/end-of-sequence tokens injected around them). Uses faster-whisper's
+    /// leading-space convention (`" " + text.trim()`) for consistent piece boundaries.
+    fn encode_raw(&self, text: &str) -> Result<Vec<String>> {
+        let with_leading_space = format!(" {}", text.trim());
+        (*self.tokenizer)
+            .encode(with_leading_space.as_str(), false)
+            .map(|encoding| encoding.get_tokens().to_vec())
+            .map_err(|err| anyhow!("failed to encode conditioning text: {err}"))
+    }
+
+    /// Runs DTW alignment for a batch of chunks that were all decoded from the same forced
+    /// `prompt` (`align()` applies one shared `start_sequence` to its whole batch, so chunks
+    /// decoded with different prompts must go through separate calls).
+    pub(super) fn align_chunks(
+        &self,
+        encoder_output: &sys::StorageView,
+        prompt: &[String],
+        gen_results: &[sys::WhisperGenerationResult],
+        num_chunks: usize,
+    ) -> Result<Vec<sys::WhisperAlignmentResult>> {
+        let start_seq: Vec<usize> = prompt
+            .iter()
+            .map(|t| {
+                self.tokenizer
+                    .token_to_id(t)
+                    .map(|id| id as usize)
+                    .unwrap_or(0)
+            })
+            .collect();
+        let num_frames = vec![self.config.nb_max_frames; num_chunks];
+        let text_tokens: Vec<Vec<usize>> = gen_results
+            .iter()
+            .map(|res| res.sequences_ids[0].clone())
+            .collect();
+
+        self.whisper
+            .align(encoder_output, &start_seq, &text_tokens, &num_frames, 7)
+    }
+}
+
+/// Treats empty/whitespace-only text as absent, so e.g. a blank form field or an empty proto3
+/// `string` can't trigger conditioning with no actual content.
+fn non_blank(text: Option<&str>) -> Option<&str> {
+    text.filter(|t| !t.trim().is_empty())
+}
+
+/// Whether a reconciled chunk falls back to its unconditioned transcript: when more than
+/// [`MAX_COPIED_FROM_PROMPT_RATIO`] of the conditioned words look copied from the prompt, or when
+/// the `merged` word starts go back by more than [`MAX_BACKWARD_JUMP_SECS`].
+fn keeps_unconditioned(copied_ratio: f32, merged: &[Word]) -> bool {
+    copied_ratio > MAX_COPIED_FROM_PROMPT_RATIO || !is_monotonic(merged, MAX_BACKWARD_JUMP_SECS)
+}
+
+/// Maximum number of `hotwords` + `initial_prompt` content tokens for a decode whose
+/// start-of-transcript sequence is `sot_len` tokens long.
+///
+/// CTranslate2 lets a Whisper decode generate `min(max_length / 2, max_length - prompt_len)` new
+/// tokens, and alignment then re-feeds `prompt + <|notimestamps|> + text + <|eot|>` through the
+/// decoder, which only has `max_length` positions. Keeping the whole conditioned prompt
+/// (`<|startofprev|>` + content + sot sequence) at most `max_length / 2 - 2` tokens therefore
+/// leaves the conditioned decode the same `max_length / 2` output budget as the plain one, and
+/// guarantees its alignment fits too.
+pub(super) fn conditioning_token_budget(max_length: usize, sot_len: usize) -> usize {
+    (max_length / 2).saturating_sub(sot_len + 3)
+}
+
+/// Fits `hotwords` and `initial_prompt` tokens into `budget` tokens in total. When both don't fit,
+/// each is guaranteed at least half of the budget, and either may use whatever the other leaves
+/// unused. Hotwords keep their head (as in faster-whisper's `hotwords_tokens[:n]`) and the initial
+/// prompt keeps its tail (as in faster-whisper's `previous_tokens[-n:]`), the end closest to the
+/// audio being transcribed.
+fn fit_to_budget(
+    mut hotwords: Vec<String>,
+    prompt: Vec<String>,
+    budget: usize,
+) -> (Vec<String>, Vec<String>) {
+    if hotwords.len() + prompt.len() <= budget {
+        return (hotwords, prompt);
+    }
+    let hotwords_keep = hotwords
+        .len()
+        .min((budget / 2).max(budget.saturating_sub(prompt.len())));
+    let prompt_keep = prompt.len().min(budget - hotwords_keep);
+
+    hotwords.truncate(hotwords_keep);
+    let prompt = prompt[prompt.len() - prompt_keep..].to_vec();
+    (hotwords, prompt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_non_blank_treats_empty_and_whitespace_as_absent() {
+        assert_eq!(non_blank(None), None);
+        assert_eq!(non_blank(Some("")), None);
+        assert_eq!(non_blank(Some(" \t\n")), None);
+        assert_eq!(non_blank(Some(" Kubernetes ")), Some(" Kubernetes "));
+    }
+
+    #[test]
+    fn test_whisper_conditioning_default_is_unset_and_copy() {
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<crate::WhisperConditioning>();
+
+        let conditioning = crate::WhisperConditioning::default();
+        assert_eq!(conditioning.initial_prompt, None);
+        assert_eq!(conditioning.hotwords, None);
+        assert!(!conditioning.reconcile_conditioning);
+    }
+
+    fn starting_at(starts: &[f32]) -> Vec<Word> {
+        starts
+            .iter()
+            .map(|&start| Word {
+                word: "word".to_string(),
+                start,
+                end: start + 0.1,
+                probability: 0.9,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_keeps_unconditioned_on_prompt_copy_or_backward_jump() {
+        let in_order = starting_at(&[1.0, 2.0, 3.0]);
+        assert!(!keeps_unconditioned(0.0, &in_order));
+        assert!(
+            !keeps_unconditioned(0.25, &in_order),
+            "25% copied is tolerated"
+        );
+        assert!(keeps_unconditioned(0.26, &in_order), "over 25% copied");
+
+        assert!(
+            !keeps_unconditioned(0.0, &starting_at(&[5.0, 4.0])),
+            "1 s back"
+        );
+        assert!(
+            keeps_unconditioned(0.0, &starting_at(&[5.0, 3.5])),
+            "1.5 s back"
+        );
+    }
+
+    fn tokens(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i}")).collect()
+    }
+
+    #[test]
+    fn test_conditioning_token_budget_leaves_room_for_output_and_alignment() {
+        // 448 / 2 = 224 positions for the prompt, minus the 3-token sot sequence,
+        // `<|startofprev|>`, and the `<|notimestamps|>`/`<|eot|>` alignment adds.
+        assert_eq!(conditioning_token_budget(448, 3), 218);
+        assert_eq!(conditioning_token_budget(4, 3), 0);
+    }
+
+    #[test]
+    fn test_fit_to_budget_leaves_short_inputs_untouched() {
+        let (hw, prompt) = fit_to_budget(tokens("h", 5), tokens("p", 5), 10);
+        assert_eq!(hw, tokens("h", 5));
+        assert_eq!(prompt, tokens("p", 5));
+    }
+
+    #[test]
+    fn test_fit_to_budget_splits_evenly_when_both_are_long() {
+        let (hw, prompt) = fit_to_budget(tokens("h", 20), tokens("p", 20), 10);
+        assert_eq!(hw, tokens("h", 5), "hotwords keep their head");
+        assert_eq!(
+            prompt,
+            tokens("p", 20)[15..],
+            "initial prompt keeps its tail"
+        );
+    }
+
+    #[test]
+    fn test_fit_to_budget_gives_unused_share_to_the_other_input() {
+        let (hw, prompt) = fit_to_budget(tokens("h", 20), tokens("p", 2), 10);
+        assert_eq!((hw.len(), prompt.len()), (8, 2));
+
+        let (hw, prompt) = fit_to_budget(tokens("h", 2), tokens("p", 20), 10);
+        assert_eq!((hw.len(), prompt.len()), (2, 8));
+        assert_eq!(prompt, tokens("p", 20)[12..]);
+    }
+
+    #[test]
+    fn test_fit_to_budget_with_single_input() {
+        let (hw, prompt) = fit_to_budget(tokens("h", 20), Vec::new(), 10);
+        assert_eq!((hw, prompt.len()), (tokens("h", 10), 0));
+
+        let (hw, prompt) = fit_to_budget(Vec::new(), tokens("p", 20), 10);
+        assert_eq!((hw.len(), prompt), (0, tokens("p", 20)[10..].to_vec()));
+    }
+}

@@ -1,0 +1,31 @@
+{
+    "rust-analyzer.inlayHints.maxLength": null,
+    "rust-analyzer.inlayHints.typeHints.enable": true,
+    "rust-analyzer.inlayHints.typeHints.hideNamedConstructor": false,
+    "rust-analyzer.inlayHints.typeHints.hideClosureInitialization": false,
+    "rust-analyzer.inlayHints.parameterHints.enable": true,
+    "rust-analyzer.inlayHints.chainingHints.enable": false,
+    "rust-analyzer.inlayHints.closingBraceHints.enable": true,
+    "rust-analyzer.inlayHints.closingBraceHints.minLines": 25,
+    "rust-analyzer.inlayHints.closureReturnTypeHints.enable": "with_block",
+    "rust-analyzer.inlayHints.lifetimeElisionHints.enable": "skip_trivial",
+    "rust-analyzer.inlayHints.lifetimeElisionHints.useParameterNames": true,
+    "rust-analyzer.inlayHints.bindingModeHints.enable": true,
+
+    "rust-analyzer.cargo.features": ["whisper"],
+    "rust-analyzer.cargo.buildScripts.overrideCommand": [
+        "cargo",
+        "check",
+        "--quiet",
+        "--package",
+        "ct2rs",
+        "--features",
+        "whisper",
+        "--message-format=json",
+        "--all-targets",
+        "--keep-going"
+    ],
+
+    "rust-analyzer.check.workspace": false,
+    "rust-analyzer.check.extraArgs": ["--package", "ct2rs"]
+}
