@@ -10,13 +10,13 @@
 
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
-use mel_spec::mel::{log_mel_spectrogram, mel, norm_mel};
-use mel_spec::stft::Spectrogram;
-use ndarray::{s, stack, Array2, Array3, Axis};
+use anyhow::{anyhow, bail, Result};
+use mel_spec::mel::{mel, SparseMelFilterbank};
+use ndarray::{Array2, Array3};
+use realfft::RealFftPlanner;
 use serde::{Deserialize, Serialize};
 
 use super::tokenizers::hf;
@@ -490,49 +490,9 @@ impl Whisper {
 
     /// Generates a log-mel spectrogram for the given audio samples.
     ///
-    /// It partitions the samples into chunks and extracts log-mel features
-    /// for each chunk.
-    ///
-    /// # Returns
-    /// A tuple containing:
-    /// - An `Array3<f32>` with the stacked log-mel spectrogram.
-    /// - The number of chunks processed.
+    /// See [`PreprocessorConfig::log_mel_spectrogram`].
     fn generate_mel_spectrogram(&self, samples: &[f32]) -> Result<(Array3<f32>, usize)> {
-        let mut stft = Spectrogram::new(self.config.n_fft, self.config.hop_length);
-
-        let mut mel_spectrogram_vec = vec![];
-        for chunk in samples.chunks(self.config.n_samples) {
-            let mut mel_spectrogram_per_chunk =
-                Array2::zeros((self.config.feature_size, self.config.nb_max_frames));
-            for (i, flame) in chunk.chunks(self.config.hop_length).enumerate() {
-                if let Some(fft_frame) = stft.add(flame) {
-                    let mel = norm_mel(&log_mel_spectrogram(&fft_frame, &self.config.mel_filters))
-                        .mapv(|v| v as f32);
-                    mel_spectrogram_per_chunk
-                        .slice_mut(s![.., i])
-                        .assign(&mel.slice(s![.., 0]));
-                }
-            }
-            mel_spectrogram_vec.push(mel_spectrogram_per_chunk);
-        }
-
-        let num_chunks = mel_spectrogram_vec.len();
-        if num_chunks == 0 {
-            return Ok((Array3::zeros((0, 0, 0)), 0));
-        }
-
-        let mut mel_spectrogram = stack(
-            Axis(0),
-            &mel_spectrogram_vec
-                .iter()
-                .map(|a| a.view())
-                .collect::<Vec<_>>(),
-        )?;
-        if !mel_spectrogram.is_standard_layout() {
-            mel_spectrogram = mel_spectrogram.as_standard_layout().into_owned();
-        }
-
-        Ok((mel_spectrogram, num_chunks))
+        self.config.log_mel_spectrogram(samples)
     }
 
     /// Detects or formats the language token.
@@ -1059,14 +1019,15 @@ struct PreprocessorConfig {
     processor_class: String,
     return_attention_mask: bool,
     sampling_rate: usize,
-    mel_filters: Array2<f64>,
+    mel_filters: SparseMelFilterbank,
 }
 
 impl PreprocessorConfig {
     fn read<T: AsRef<Path>>(path: T) -> Result<Self> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
+        Self::from_reader(BufReader::new(File::open(path)?))
+    }
 
+    fn from_reader<R: Read>(reader: R) -> Result<Self> {
         #[derive(Deserialize)]
         struct PreprocessorConfigAux {
             chunk_length: usize,
@@ -1100,6 +1061,27 @@ impl PreprocessorConfig {
                 true,
             )
         };
+        let mel_filters = SparseMelFilterbank::from_dense(&mel_filters);
+
+        if mel_filters.n_mels() != aux.feature_size || mel_filters.fft_bins() != aux.n_fft / 2 + 1 {
+            bail!(
+                "mel_filters must be {} x {} for feature_size {} and n_fft {}, got {} x {}",
+                aux.feature_size,
+                aux.n_fft / 2 + 1,
+                aux.feature_size,
+                aux.n_fft,
+                mel_filters.n_mels(),
+                mel_filters.fft_bins()
+            );
+        }
+        if aux.nb_max_frames * aux.hop_length != aux.n_samples {
+            bail!(
+                "nb_max_frames ({}) x hop_length ({}) must equal n_samples ({})",
+                aux.nb_max_frames,
+                aux.hop_length,
+                aux.n_samples
+            );
+        }
 
         Ok(Self {
             chunk_length: aux.chunk_length,
@@ -1116,6 +1098,276 @@ impl PreprocessorConfig {
             sampling_rate: aux.sampling_rate,
             mel_filters,
         })
+    }
+
+    /// Computes Whisper's log-mel features for `samples`, as openai-whisper's
+    /// `log_mel_spectrogram(audio, padding=N_SAMPLES)` sliced into `n_samples` windows.
+    ///
+    /// The samples are zero-padded to whole chunks and run through one centred STFT
+    /// (reflect padding, periodic Hann window). Values are clamped to the maximum over the
+    /// whole input minus 8, so the padding after the audio holds the silence floor.
+    ///
+    /// # Returns
+    /// A tuple containing:
+    /// - An `Array3<f32>` of shape `[chunks, feature_size, nb_max_frames]`.
+    /// - The number of chunks.
+    fn log_mel_spectrogram(&self, samples: &[f32]) -> Result<(Array3<f32>, usize)> {
+        let num_chunks = samples.len().div_ceil(self.n_samples);
+        if num_chunks == 0 {
+            return Ok((Array3::zeros((0, 0, 0)), 0));
+        }
+
+        let padded = reflect_pad(samples, num_chunks * self.n_samples, self.n_fft / 2);
+        let window = periodic_hann(self.n_fft);
+        let fft = RealFftPlanner::<f64>::new().plan_fft_forward(self.n_fft);
+        let mut input = fft.make_input_vec();
+        let mut spectrum = fft.make_output_vec();
+        let mut scratch = fft.make_scratch_vec();
+        let mut power = vec![0.0; self.mel_filters.fft_bins()];
+        let mut energies = vec![0.0; self.feature_size];
+
+        let mut features = Array3::zeros((num_chunks, self.feature_size, self.nb_max_frames));
+        let data = features
+            .as_slice_mut()
+            .ok_or_else(|| anyhow!("mel spectrogram must be contiguous"))?;
+        let mut max = f64::NEG_INFINITY;
+        for t in 0..num_chunks * self.nb_max_frames {
+            let frame = &padded[t * self.hop_length..t * self.hop_length + self.n_fft];
+            for ((input, sample), weight) in input.iter_mut().zip(frame).zip(&window) {
+                *input = *sample as f64 * weight;
+            }
+            fft.process_with_scratch(&mut input, &mut spectrum, &mut scratch)?;
+            for (power, value) in power.iter_mut().zip(&spectrum) {
+                *power = value.norm_sqr();
+            }
+            self.mel_filters.project_power_f64(&power, &mut energies);
+
+            let (chunk, column) = (t / self.nb_max_frames, t % self.nb_max_frames);
+            for (mel, energy) in energies.iter().enumerate() {
+                let value = energy.max(1e-10).log10();
+                max = max.max(value);
+                data[(chunk * self.feature_size + mel) * self.nb_max_frames + column] =
+                    value as f32;
+            }
+        }
+
+        let floor = (max - 8.0) as f32;
+        features.mapv_inplace(|v| (v.max(floor) + 4.0) / 4.0);
+        Ok((features, num_chunks))
+    }
+}
+
+/// Zero-pads `samples` to `len`, then mirrors `pad` samples onto each side without repeating
+/// the edge sample, like `torch.stft(center=True, pad_mode="reflect")`.
+fn reflect_pad(samples: &[f32], len: usize, pad: usize) -> Vec<f32> {
+    let mut signal = samples.to_vec();
+    signal.resize(len, 0.0);
+
+    let mut padded = Vec::with_capacity(len + 2 * pad);
+    padded.extend((1..=pad).rev().map(|i| signal[i]));
+    padded.extend_from_slice(&signal);
+    padded.extend((0..pad).map(|i| signal[len - 2 - i]));
+    padded
+}
+
+/// Periodic Hann window, as `torch.hann_window(n)`.
+fn periodic_hann(n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests_mel {
+    use ndarray::Array1;
+
+    use super::*;
+
+    const SAMPLING_RATE: usize = 16_000;
+    const N_FFT: usize = 400;
+    const HOP_LENGTH: usize = 160;
+    const N_SAMPLES: usize = 480_000;
+    const N_FRAMES: usize = 3000;
+    const N_MELS: usize = 80;
+
+    /// whisper-tiny's `preprocessor_config.json`, without `mel_filters`.
+    fn config_json(feature_size: usize, n_fft: usize) -> String {
+        format!(
+            r#"{{
+                "chunk_length": 30, "feature_extractor_type": "WhisperFeatureExtractor",
+                "feature_size": {feature_size}, "hop_length": {HOP_LENGTH}, "n_fft": {n_fft},
+                "n_samples": {N_SAMPLES}, "nb_max_frames": {N_FRAMES}, "padding_side": "right",
+                "padding_value": 0.0, "processor_class": "WhisperProcessor",
+                "return_attention_mask": false, "sampling_rate": {SAMPLING_RATE}
+            }}"#
+        )
+    }
+
+    fn config() -> PreprocessorConfig {
+        PreprocessorConfig::from_reader(config_json(N_MELS, N_FFT).as_bytes()).unwrap()
+    }
+
+    fn dense_filters() -> Array2<f64> {
+        mel(SAMPLING_RATE as f64, N_FFT, N_MELS, None, None, false, true)
+    }
+
+    /// A sine sweep plus noise, broken by silent gaps, lasting `seconds`.
+    fn speech_like(seconds: usize) -> Vec<f32> {
+        let mut seed = 0x2545_f491_u32;
+        (0..seconds * SAMPLING_RATE)
+            .map(|i| {
+                let t = i as f32 / SAMPLING_RATE as f32;
+                if (t as usize) % 7 == 6 {
+                    return 0.0;
+                }
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 8) as f32 / (1 << 24) as f32 - 0.5;
+                0.5 * (2.0 * std::f32::consts::PI * (200.0 + 40.0 * t) * t).sin() + 0.05 * noise
+            })
+            .collect()
+    }
+
+    /// openai-whisper's `log_mel_spectrogram` over the padded samples, written independently of
+    /// `mel_spec`'s sparse projection: dense filters and a plain normalization pass.
+    fn reference(samples: &[f32]) -> Array3<f32> {
+        let num_chunks = samples.len().div_ceil(N_SAMPLES);
+        let pad = N_FFT / 2;
+        let mut signal = samples.to_vec();
+        signal.resize(num_chunks * N_SAMPLES, 0.0);
+        let n = signal.len();
+        let padded: Vec<f32> = (0..n + 2 * pad)
+            .map(|i| match i.checked_sub(pad) {
+                None => signal[pad - i],
+                Some(j) if j < n => signal[j],
+                Some(j) => signal[2 * (n - 1) - j],
+            })
+            .collect();
+
+        let filters = dense_filters();
+        let fft = RealFftPlanner::<f64>::new().plan_fft_forward(N_FFT);
+        let mut log = Array3::<f64>::zeros((num_chunks, N_MELS, N_FRAMES));
+        for t in 0..num_chunks * N_FRAMES {
+            let mut input: Vec<f64> = (0..N_FFT)
+                .map(|i| {
+                    let w =
+                        0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / N_FFT as f64).cos());
+                    padded[t * HOP_LENGTH + i] as f64 * w
+                })
+                .collect();
+            let mut spectrum = fft.make_output_vec();
+            fft.process(&mut input, &mut spectrum).unwrap();
+            let power = Array1::from_iter(spectrum.iter().map(|c| c.norm_sqr()));
+            let energies = filters.dot(&power);
+            for (mel, energy) in energies.iter().enumerate() {
+                log[[t / N_FRAMES, mel, t % N_FRAMES]] = energy.max(1e-10).log10();
+            }
+        }
+
+        let max = log.fold(f64::NEG_INFINITY, |acc, &v| acc.max(v));
+        log.mapv(|v| ((v.max(max - 8.0) + 4.0) / 4.0) as f32)
+    }
+
+    fn max_abs_diff(a: &Array3<f32>, b: &Array3<f32>) -> f32 {
+        assert_eq!(a.shape(), b.shape());
+        a.iter()
+            .zip(b)
+            .fold(0.0, |acc, (x, y)| acc.max((x - y).abs()))
+    }
+
+    #[test]
+    fn test_log_mel_spectrogram_matches_whisper_reference() {
+        let samples = speech_like(65);
+        let (features, num_chunks) = config().log_mel_spectrogram(&samples).unwrap();
+        assert_eq!(num_chunks, 3);
+        let diff = max_abs_diff(&features, &reference(&samples));
+        assert!(diff < 1e-5, "max |difference| from the reference is {diff}");
+    }
+
+    #[test]
+    fn test_log_mel_spectrogram_shapes() {
+        let config = config();
+        let (features, num_chunks) = config.log_mel_spectrogram(&[]).unwrap();
+        assert_eq!((features.shape(), num_chunks), (&[0, 0, 0][..], 0));
+
+        for (len, chunks) in [(SAMPLING_RATE, 1), (N_SAMPLES, 1), (N_SAMPLES + 1, 2)] {
+            let (features, num_chunks) = config.log_mel_spectrogram(&vec![0.1; len]).unwrap();
+            assert_eq!(num_chunks, chunks, "{len} samples");
+            assert_eq!(
+                features.shape(),
+                &[chunks, N_MELS, N_FRAMES],
+                "{len} samples"
+            );
+            assert!(features.is_standard_layout());
+        }
+    }
+
+    #[test]
+    fn test_log_mel_spectrogram_padding_is_silence_floor() {
+        let samples = speech_like(5);
+        let (features, _) = config().log_mel_spectrogram(&samples).unwrap();
+
+        let max = features.fold(f32::NEG_INFINITY, |acc, &v| acc.max(v));
+        let floor = max - 2.0;
+        // The last frame touching audio is centred at 5 s minus half a window.
+        let first_padding_frame = (samples.len() + N_FFT / 2) / HOP_LENGTH + 1;
+        for column in first_padding_frame..N_FRAMES {
+            for mel in 0..N_MELS {
+                let value = features[[0, mel, column]];
+                assert!(
+                    (value - floor).abs() < 1e-6,
+                    "frame {column}, mel {mel}: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_log_mel_spectrogram_frames_are_centred() {
+        let config = config();
+        for frame in [0, 1, 7, 1500, N_FRAMES - 1] {
+            let mut samples = vec![0.0; N_SAMPLES];
+            samples[frame * HOP_LENGTH] = 1.0;
+            let (features, _) = config.log_mel_spectrogram(&samples).unwrap();
+
+            let energy = |column: usize| features.slice(ndarray::s![0, .., column]).sum();
+            let loudest = (0..N_FRAMES)
+                .max_by(|&a, &b| energy(a).total_cmp(&energy(b)))
+                .unwrap();
+            assert_eq!(loudest, frame, "impulse at sample {}", frame * HOP_LENGTH);
+        }
+    }
+
+    #[test]
+    fn test_log_mel_spectrogram_of_silence() {
+        let (features, _) = config().log_mel_spectrogram(&vec![0.0; 1000]).unwrap();
+        assert!(features.iter().all(|&v| v == -1.5));
+    }
+
+    #[test]
+    fn test_preprocessor_config_rejects_mismatched_filters() {
+        assert!(PreprocessorConfig::from_reader(config_json(N_MELS, N_FFT).as_bytes()).is_ok());
+        for (feature_size, n_fft) in [(128, N_FFT), (N_MELS, 512)] {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&config_json(N_MELS, N_FFT)).unwrap();
+            json["mel_filters"] = serde_json::to_value(
+                mel(
+                    SAMPLING_RATE as f64,
+                    n_fft,
+                    feature_size,
+                    None,
+                    None,
+                    false,
+                    true,
+                )
+                .outer_iter()
+                .map(|row| row.to_vec())
+                .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let json = json.to_string();
+            let error = PreprocessorConfig::from_reader(json.as_bytes()).unwrap_err();
+            assert!(error.to_string().contains("mel_filters"), "{error}");
+        }
     }
 }
 
@@ -1727,8 +1979,8 @@ mod tests {
 
     /// With `reconcile_conditioning`, conditioned segments are ADR 001's two-pass reconciliation.
     /// The expected text was recorded from that implementation before single-pass conditioning
-    /// existed, on the CPU `ruy` backend; other backends may legitimately transcribe differently,
-    /// so they skip.
+    /// existed, then re-recorded when the log-mel features changed (ADR 004), on the CPU `ruy`
+    /// backend; other backends may legitimately transcribe differently, so they skip.
     #[test]
     fn test_whisper_reconciled_conditioning_matches_adr_001() {
         if !cfg!(feature = "ruy") || cfg!(feature = "cuda") {
@@ -1750,11 +2002,11 @@ mod tests {
             texts,
             vec![
                 "The birch can use lid on the smooth planks. Glue the sheet to the dark blue \
-                 background. It is easy to tell the depth of a well. These days, the chicken leg \
-                 is a rare dish. Rice is also served in round bowls. The juice of lemon makes fine \
-                 punch. The box was thrown beside the pork chuck. The hogs are fed chopped corn \
-                 and garbage.",
-                "A large size and stockings is hard to sell.",
+                 background. It is easy to tell the depth of a well. These days the chicken leg \
+                 is a rare dish. Rice is often served in round bowls. The juice of lemon makes \
+                 fine punch. The box was thrown beside the pork chuck. The hogs are fed chopped \
+                 corn and garbage.",
+                "A large size in stockings is hard to sell.",
             ]
         );
         let word_counts: Vec<usize> = segments
@@ -1765,8 +2017,9 @@ mod tests {
     }
 
     /// Attaching punctuation to words must not change the unconditioned `Segment.text`, which is
-    /// decoded from the tokens. The expected text was recorded before the change, on the CPU
-    /// `ruy` backend; other backends may legitimately transcribe differently, so they skip.
+    /// decoded from the tokens. The expected text was recorded before the change, then
+    /// re-recorded when the log-mel features changed (ADR 004), on the CPU `ruy` backend; other
+    /// backends may legitimately transcribe differently, so they skip.
     #[test]
     fn test_whisper_plain_segment_text_matches_base() {
         if !cfg!(feature = "ruy") || cfg!(feature = "cuda") {
@@ -1784,10 +2037,10 @@ mod tests {
             vec![
                 "The birch can use lid on the smooth planks. Glue the sheet to the dark blue \
                  background. It is easy to tell the depth of a well. These days, the chicken leg \
-                 is a rare dish. Rice is also served in round bowls. The juice of lemon makes fine \
-                 punch. The box was thrown beside the pork truck. The hogs were fed chopped corn \
-                 and garbage.",
-                "A large size and stockings is hard to sell.",
+                 is a rare dish. Rice is often served in round bowls. The juice of lemon makes \
+                 fine punch. The box was thrown beside the pork chuck. The hogs are fed chopped \
+                 corn and garbage.",
+                "A large size of stockings is hard to sell.",
             ]
         );
     }

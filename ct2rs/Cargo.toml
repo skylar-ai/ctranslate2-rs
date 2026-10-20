@@ -40,8 +40,9 @@ sentencepiece = { version = "0.13", optional = true }
 tokenizers = { version = "0.22", optional = true }
 
 # Dependencies for Whisper model
-mel_spec = { version = "0.3", optional = true }
+mel_spec = { version = "0.5", optional = true }
 ndarray = { version = "0.16", optional = true }
+realfft = { version = "3.5", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 
@@ -72,6 +73,7 @@ default = ["all-tokenizers", "ruy", "cuda-small-binary"]
 whisper = [
     "dep:mel_spec",
     "dep:ndarray",
+    "dep:realfft",
     "dep:serde",
     "dep:serde_json",
     "all-tokenizers",
