@@ -33,3 +33,10 @@ Pick the environment that provides the dependencies your features need:
   `check-whisper-dyn` tasks, which select their own environment and
   `CARGO_TARGET_DIR`.
 - `ct2rs-platform`: use the `platform` environment (`-e platform`).
+
+## Run lint before committing
+
+Run `pixi run lint` before every commit. It runs the same pre-commit hooks as
+the CI `check` job: dprint (Markdown, TOML), rustfmt, end-of-file and
+trailing-whitespace fixers, yamlfmt, and clang-format. Hooks fix files in
+place, so run it again until every hook passes, then stage the fixes.
