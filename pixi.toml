@@ -90,6 +90,7 @@ platform = ["platform-cuda-dyn", "tensor-parallel", "hub"]
 platform-cuda-dyn = ["platform-cuda-dyn", "hub"]
 platform-cuda-full = ["platform-cuda-dyn", "platform-cuda-full", "hub"]
 hub = ["hub"]
+lint = ["lint"]
 
 [feature.platform-cuda-dyn.dependencies]
 cuda-version = "12.9.*"
@@ -115,3 +116,10 @@ nccl = "*"
 [feature.hub.dependencies]
 openssl = ">=3.6.4,<4"
 pkg-config = ">=0.29.2,<0.30"
+
+[feature.lint.dependencies]
+dprint = "*"
+pre-commit = "*"
+
+[feature.lint.tasks]
+lint = "pre-commit run --all-files"
