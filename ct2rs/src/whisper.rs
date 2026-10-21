@@ -1376,6 +1376,7 @@ mod tests_mel {
 mod tests {
     use crate::{download_model, Config, Device, Tokenizer, Whisper, WhisperConditioning};
     use std::path::Path;
+    use std::sync::OnceLock;
 
     const MODEL_ID: &str = "jkawamoto/whisper-tiny-ct2";
 
@@ -1463,19 +1464,7 @@ mod tests {
         )
         .unwrap();
 
-        let wav_path = std::path::Path::new("tests/assets/test.wav");
-        if !wav_path.exists() {
-            if let Some(parent) = wav_path.parent() {
-                std::fs::create_dir_all(parent).expect("failed to create directory for wav file");
-            }
-            let url =
-                "https://www.voiptroubleshooter.com/open_speech/american/OSR_us_000_0010_8k.wav";
-            let response = ureq::get(url).call().expect("failed to download wav file");
-            let mut out = std::fs::File::create(wav_path).expect("failed to create wav file");
-            std::io::copy(&mut response.into_reader(), &mut out).expect("failed to write wav file");
-        }
-
-        let samples = read_audio(wav_path, w.sampling_rate()).unwrap();
+        let samples = load_test_audio(&w);
 
         let segments = w
             .generate_segments(&samples, Some("en"), &Default::default())
@@ -1586,8 +1575,34 @@ mod tests {
             wav_path.exists(),
             "run test_whisper_generate_segments_prompt_conditioning_comparison first to fetch it"
         );
-        read_audio(wav_path, w.sampling_rate()).unwrap()
+
+    /// Returns the path to `tests/assets/test.wav`, downloading it on first use.
+    ///
+    /// Tests run in parallel, so the download runs once behind a `OnceLock` and is written to a
+    /// temporary file then renamed, so no test reads a partially written file.
+    fn test_wav_path() -> &'static Path {
+        static WAV_PATH: OnceLock<&'static Path> = OnceLock::new();
+        WAV_PATH.get_or_init(|| {
+            let wav_path = Path::new("tests/assets/test.wav");
+            if !wav_path.exists() {
+                if let Some(parent) = wav_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .expect("failed to create directory for wav file");
+                }
+                let url =
+                    "https://www.voiptroubleshooter.com/open_speech/american/OSR_us_000_0010_8k.wav";
+                let response = ureq::get(url).call().expect("failed to download wav file");
+                let tmp_path = wav_path.with_extension("wav.part");
+                let mut out = std::fs::File::create(&tmp_path).expect("failed to create wav file");
+                std::io::copy(&mut response.into_reader(), &mut out)
+                    .expect("failed to write wav file");
+                drop(out);
+                std::fs::rename(&tmp_path, wav_path).expect("failed to move wav file into place");
+            }
+            wav_path
+        })
     }
+
 
     fn load_test_model() -> Whisper {
         let model_path = download_model(MODEL_ID).unwrap();
