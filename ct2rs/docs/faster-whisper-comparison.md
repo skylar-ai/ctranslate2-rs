@@ -29,16 +29,16 @@ chunks in one batch and gives every chunk the same prompt.
 
 ## Summary
 
-| Area                | `generate_segments`                                                                                                                                                                                                                                                                                         | faster-whisper sequential                                                                                                                                                                 | faster-whisper batched                                                                             |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Audio windowing     | Fixed 30-second chunks, encoded and decoded as one batch                                                                                                                                                                                                                                                    | A moving window that resumes at the last complete timestamp, or at the last word's end, so words aren't cut at window edges                                                               | Speech chunks found by Silero VAD (on by default), decoded in batches of 8                         |
-| Segments returned   | One `Segment` per 30-second chunk                                                                                                                                                                                                                                                                           | Split at timestamp tokens into sentence-sized segments                                                                                                                                    | Split at timestamp tokens, like sequential                                                         |
-| Prompt              | Static `<\|startofprev\|>` + hotwords + initial prompt on every chunk                                                                                                                                                                                                                                       | Rolling previous text (`condition_on_previous_text=True`), seeded by `initial_prompt`; hotwords only when there is no `prefix`; the prompt resets when the decode temperature exceeds 0.5 | Static prompt on every chunk, in the same order as `generate_segments`; rolling text is always off |
-| Decoding            | One decode per chunk, with `WhisperOptions` as given                                                                                                                                                                                                                                                        | Temperature fallback from 0.0 to 1.0 in steps of 0.2 on repetitive or low-confidence output; skips windows that contain no speech                                                         | One decode at the first temperature                                                                |
-| Conditioning safety | By default none: one conditioned decode, used as-is ([ADR 003](adr/003-single-pass-whisper-conditioning-by-default.md)). With `reconcile_conditioning = true`, two decodes merged word by word, so no unconditioned word is lost ([ADR 001](adr/001-word-level-reconciliation-for-whisper-conditioning.md)) | None; the single conditioned decode is used as-is                                                                                                                                         | None                                                                                               |
-| Alignment input     | By default, plain start-of-transcript tokens; with `reconcile_conditioning = true`, each decode's own prompt, so the conditioned decode includes its conditioning prefix. Either way, every generated token ID, timestamp tokens included                                                                   | Plain start-of-transcript tokens plus text tokens only (`token < eot`)                                                                                                                    | Same as sequential                                                                                 |
-| Word timing fixes   | Punctuation attached to neighboring words ([ADR 002](adr/002-attach-punctuation-to-whisper-words-in-token-grouping.md))                                                                                                                                                                                     | Punctuation merge, plus trimming overly long words at pauses and sentence ends, and snapping words to segment timestamps                                                                  | Same as sequential                                                                                 |
-| Extras              | None                                                                                                                                                                                                                                                                                                        | `clip_timestamps`, `prefix`, `max_new_tokens`, `hallucination_silence_threshold`, and per-window language detection                                                                       | VAD and per-chunk language detection                                                               |
+| Area | `generate_segments` | faster-whisper sequential | faster-whisper batched |
+| --- | --- | --- | --- |
+| Audio windowing | Fixed 30-second chunks, encoded and decoded as one batch | A moving window that resumes at the last complete timestamp, or at the last word's end, so words aren't cut at window edges | Speech chunks found by Silero VAD (on by default), decoded in batches of 8 |
+| Segments returned | One `Segment` per 30-second chunk | Split at timestamp tokens into sentence-sized segments | Split at timestamp tokens, like sequential |
+| Prompt | Static `<\|startofprev\|>` + hotwords + initial prompt on every chunk | Rolling previous text (`condition_on_previous_text=True`), seeded by `initial_prompt`; hotwords only when there is no `prefix`; the prompt resets when the decode temperature exceeds 0.5 | Static prompt on every chunk, in the same order as `generate_segments`; rolling text is always off |
+| Decoding | One decode per chunk, with `WhisperOptions` as given | Temperature fallback from 0.0 to 1.0 in steps of 0.2 on repetitive or low-confidence output; skips windows that contain no speech | One decode at the first temperature |
+| Conditioning safety | By default none: one conditioned decode, used as-is ([ADR 003](adr/003-single-pass-whisper-conditioning-by-default.md)). With `reconcile_conditioning = true`, two decodes merged word by word, so no unconditioned word is lost ([ADR 001](adr/001-word-level-reconciliation-for-whisper-conditioning.md)) | None; the single conditioned decode is used as-is | None |
+| Alignment input | By default, plain start-of-transcript tokens; with `reconcile_conditioning = true`, each decode's own prompt, so the conditioned decode includes its conditioning prefix. Either way, every generated token ID, timestamp tokens included | Plain start-of-transcript tokens plus text tokens only (`token < eot`) | Same as sequential |
+| Word timing fixes | Punctuation attached to neighboring words ([ADR 002](adr/002-attach-punctuation-to-whisper-words-in-token-grouping.md)) | Punctuation merge, plus trimming overly long words at pauses and sentence ends, and snapping words to segment timestamps | Same as sequential |
+| Extras | None | `clip_timestamps`, `prefix`, `max_new_tokens`, `hallucination_silence_threshold`, and per-window language detection | VAD and per-chunk language detection |
 
 The rest of this page explains each row.
 
@@ -199,18 +199,18 @@ faster-whisper also detects the language from the first window by default
 The two faster-whisper pipelines use different defaults for the same
 arguments:
 
-| Argument                          | Sequential                       | Batched                                 |
-| --------------------------------- | -------------------------------- | --------------------------------------- |
-| `beam_size`                       | 5                                | 5                                       |
-| `temperature`                     | `[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]` | Same list; only the first value is used |
-| `condition_on_previous_text`      | `True`                           | Always `False`                          |
-| `without_timestamps`              | `False`                          | `True`                                  |
-| `word_timestamps`                 | `False`                          | `False`                                 |
-| `vad_filter`                      | `False`                          | `True`                                  |
-| `compression_ratio_threshold`     | 2.4                              | Not used for retries                    |
-| `log_prob_threshold`              | -1.0                             | Not used for retries                    |
-| `no_speech_threshold`             | 0.6                              | Not used for skipping                   |
-| `hallucination_silence_threshold` | `None` (off)                     | Not supported                           |
+| Argument | Sequential | Batched |
+| --- | --- | --- |
+| `beam_size` | 5 | 5 |
+| `temperature` | `[0.0, 0.2, 0.4, 0.6, 0.8, 1.0]` | Same list; only the first value is used |
+| `condition_on_previous_text` | `True` | Always `False` |
+| `without_timestamps` | `False` | `True` |
+| `word_timestamps` | `False` | `False` |
+| `vad_filter` | `False` | `True` |
+| `compression_ratio_threshold` | 2.4 | Not used for retries |
+| `log_prob_threshold` | -1.0 | Not used for retries |
+| `no_speech_threshold` | 0.6 | Not used for skipping |
+| `hallucination_silence_threshold` | `None` (off) | Not supported |
 
 ## Porting faster-whisper behavior to Rust
 
