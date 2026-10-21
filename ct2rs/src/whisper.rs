@@ -1450,20 +1450,7 @@ mod tests {
 
     #[test]
     fn test_whisper_generate_segments() {
-        let model_path = download_model(MODEL_ID).unwrap();
-        let w = Whisper::new(
-            &model_path,
-            Config {
-                device: if cfg!(feature = "cuda") {
-                    Device::CUDA
-                } else {
-                    Device::CPU
-                },
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
+        let w = load_test_model();
         let samples = load_test_audio(&w);
 
         let segments = w
@@ -1505,33 +1492,8 @@ mod tests {
     /// into the transcribed text/words either way.
     #[test]
     fn test_whisper_generate_segments_prompt_conditioning_comparison() {
-        let model_path = download_model(MODEL_ID).unwrap();
-        let w = Whisper::new(
-            &model_path,
-            Config {
-                device: if cfg!(feature = "cuda") {
-                    Device::CUDA
-                } else {
-                    Device::CPU
-                },
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let wav_path = std::path::Path::new("tests/assets/test.wav");
-        if !wav_path.exists() {
-            if let Some(parent) = wav_path.parent() {
-                std::fs::create_dir_all(parent).expect("failed to create directory for wav file");
-            }
-            let url =
-                "https://www.voiptroubleshooter.com/open_speech/american/OSR_us_000_0010_8k.wav";
-            let response = ureq::get(url).call().expect("failed to download wav file");
-            let mut out = std::fs::File::create(wav_path).expect("failed to create wav file");
-            std::io::copy(&mut response.into_reader(), &mut out).expect("failed to write wav file");
-        }
-
-        let samples = read_audio(wav_path, w.sampling_rate()).unwrap();
+        let w = load_test_model();
+        let samples = load_test_audio(&w);
 
         let baseline = w
             .generate_segments(&samples, Some("en"), &Default::default())
@@ -1569,13 +1531,6 @@ mod tests {
         }
     }
 
-    fn load_test_audio(w: &Whisper) -> Vec<f32> {
-        let wav_path = Path::new("tests/assets/test.wav");
-        assert!(
-            wav_path.exists(),
-            "run test_whisper_generate_segments_prompt_conditioning_comparison first to fetch it"
-        );
-
     /// Returns the path to `tests/assets/test.wav`, downloading it on first use.
     ///
     /// Tests run in parallel, so the download runs once behind a `OnceLock` and is written to a
@@ -1603,6 +1558,9 @@ mod tests {
         })
     }
 
+    fn load_test_audio(w: &Whisper) -> Vec<f32> {
+        read_audio(test_wav_path(), w.sampling_rate()).unwrap()
+    }
 
     fn load_test_model() -> Whisper {
         let model_path = download_model(MODEL_ID).unwrap();
